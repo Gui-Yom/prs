@@ -10,7 +10,7 @@ async fn main() {
     let port = 5001;
     info!("Server addr is : {server_ip}:{port}");
 
-    let mut client = TcpUdpStream::connect(server_ip, port)
+    let client = TcpUdpStream::connect(server_ip, port)
         .await
         .expect("Connection failed");
     info!("Connected !");
