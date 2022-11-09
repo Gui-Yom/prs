@@ -1,36 +1,27 @@
-use std::collections::HashMap;
-use std::io::ErrorKind;
-use std::net::{Ipv4Addr, SocketAddr};
-use std::time::{Duration, Instant};
-use async_std::io::{ReadExt, timeout};
-use async_std::net::UdpSocket;
-use tracing::{debug, error, info, Level};
-use tracing_subscriber::{fmt, FmtSubscriber};
+use std::sync::Arc;
+use tokio::{fs, task};
 use tp3rs::TcpUdpListener;
+use tracing::{debug, info, Level};
+use tracing_subscriber::fmt;
 
-const ACK_TIMEOUT: Duration = Duration::from_secs(5);
-
-#[async_std::main]
+#[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() {
     fmt().with_max_level(Level::DEBUG).init();
 
-    let server_addr = SocketAddr::new(Ipv4Addr::new(0, 0, 0, 0).into(), 5001);
-    let listener = TcpUdpListener::bind(server_addr).await.unwrap();
-    info!("Listening on {server_addr}");
+    let port = 5001;
+    let mut listener = TcpUdpListener::bind("0.0.0.0", port).await.unwrap();
+    info!("Listening on 0.0.0.0:{port}");
+
+    let buf = Arc::new(fs::read("Cargo.lock").await.unwrap());
+    debug!("File is {} bytes", buf.len());
 
     loop {
-        let client = listener.accept().await.unwrap();
-        async_std::task::spawn(async move {
-            let mut file = async_std::fs::File::open("Cargo.lock").await?;
-            let mut buf = vec![0; 1024];
-            loop {
-                let n = file.read(&mut buf).await?;
-                if n > 0 {
-                    client.write(&buf[..n]).await?;
-                } else {
-                    break;
-                }
-            }
+        let mut client = listener.accept().await;
+        let bufr = buf.clone();
+        task::spawn(async move {
+            client.write(bufr.as_ref()).await.unwrap();
+            client.flush().await;
+            info!("Copy finished");
         });
     }
 }
