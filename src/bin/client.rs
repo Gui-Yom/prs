@@ -15,6 +15,8 @@ async fn main() {
         .expect("Connection failed");
     info!("Connected !");
 
+    client.write(b"Cargo.lock\0").await.unwrap();
+
     let mut buf = [0; 1024];
     loop {
         let n = client.read(&mut buf).await.unwrap();
