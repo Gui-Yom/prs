@@ -15,11 +15,13 @@ use tokio::time::timeout;
 use tokio::{select, task};
 use tracing::{debug, error, instrument};
 
+pub mod stats;
+
 const ACK_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_PACKET_SIZE: usize = 1024;
 const MAX_RETRIES: usize = 3;
 const WINDOW_CAP: usize = 4;
-const MAX_ACK_RECEIVED: u32 = 3;
+const MAX_ACK_RECEIVED: i32 = 3;
 
 #[derive(Debug)]
 struct Inner {
@@ -60,7 +62,6 @@ impl TcpUdpStream {
             let mut frame = [0; MAX_PACKET_SIZE];
             // TODO start seq at 1
             let mut snd_seq = 0;
-            let mut rcv_seq = 0;
             let mut last_successful_ack = 0;
             let mut retransmit_threshold = MAX_ACK_RECEIVED;
 
@@ -102,7 +103,6 @@ impl TcpUdpStream {
                 }
             }
 
-            let mut rejected = false;
             'main: loop {
                 let window_len = window.lock().await.len();
                 debug!(window_len, "New loop");
@@ -153,26 +153,7 @@ impl TcpUdpStream {
                                         }
                                     }
                                 } else {
-                                    let frameseq: u32 = String::from_utf8_lossy(&frame[..6]).parse().unwrap();
-                                    if frameseq != rcv_seq {
-                                        debug!(seq = frameseq, "Received unexpected frame");
-                                        // Send ack when reading a packet
-                                        sock.send(format!("ACK{}", rcv_seq - 1).as_bytes()).await.unwrap();
-                                        debug!(seq = rcv_seq - 1, "Sent ACK");
-                                    } else {
-                                        if frameseq == 100008 && !rejected {
-                                            rejected = true;
-                                        } else {
-                                            let mut rcv = rcvbuf.lock().await;
-                                            rcv.write(&frame[6..n]).unwrap();
-                                            debug!(n = n-6, "Received data");
-                                            // Send ack when reading a packet
-                                            sock.send(format!("ACK{frameseq}").as_bytes()).await.unwrap();
-                                            debug!(seq = frameseq, "Sent ACK");
-                                            has_rcv_data.notify_one();
-                                            rcv_seq += 1;
-                                        }
-                                    }
+                                    error!("Received something other than an ACK");
                                 }
                             }
                             Err(e) => {
@@ -334,7 +315,6 @@ impl TcpUdpListener {
         Ok(Self { accept_rx: rx })
     }
 
-    #[instrument]
     async fn accept_loop(sock: UdpSocket, tx: UnboundedSender<TcpUdpStream>, mut next_port: u16) {
         // Clients we are having a handshake with
         let mut clients = HashMap::<SocketAddr, (Instant, UdpSocket)>::new();
