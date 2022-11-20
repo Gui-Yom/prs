@@ -8,7 +8,7 @@ use tracing_subscriber::layer::Context;
 use tracing_subscriber::Layer;
 
 pub trait StatsRecorder {
-    fn record_int(&mut self, field: &Field, value: i128) {}
+    fn record_int(&mut self, _field: &Field, _value: i128) {}
 }
 
 /// Trait adapter
@@ -33,7 +33,7 @@ impl<R: StatsRecorder> Visit for VisitWrapper<R> {
         (*self.0).borrow_mut().record_int(field, value as i128);
     }
 
-    fn record_debug(&mut self, field: &Field, value: &dyn Debug) {}
+    fn record_debug(&mut self, _field: &Field, _value: &dyn Debug) {}
 }
 
 pub struct StatsLayer<R>(Mutex<VisitWrapper<R>>);
@@ -52,17 +52,13 @@ impl<R: StatsRecorder + 'static, S: Subscriber> Layer<S> for StatsLayer<R> {
 
 #[derive(Default)]
 pub struct WindowStatsRecorder {
-    next: String,
     pub values: Vec<u64>,
 }
 
 impl StatsRecorder for WindowStatsRecorder {
     fn record_int(&mut self, field: &Field, value: i128) {
-        match field.name() {
-            "window_len" => {
-                self.values.push(value as u64);
-            }
-            _ => {}
+        if "window_len" == field.name() {
+            self.values.push(value as u64);
         }
     }
 }

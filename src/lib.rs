@@ -1,307 +1,133 @@
-//! TCP over UDP library
-//! Fully async
+//! UDP control protocol unidirectional server library
+//! Fully asynchronous API
 
 use std::collections::{HashMap, VecDeque};
-use std::future::Future;
 use std::io;
-use std::io::{Error, ErrorKind, Read, Write};
+use std::io::Cursor;
+use std::io::Write;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::Arc;
+use std::str::from_utf8_unchecked;
 use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
+use tokio::sync::mpsc;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
-use tokio::sync::{mpsc, Mutex, Notify};
+use tokio::task;
 use tokio::time::timeout;
-use tokio::{select, task};
-use tracing::{debug, error, instrument};
-
-pub mod stats;
+use tracing::{debug, error};
 
 const ACK_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_PACKET_SIZE: usize = 1024;
-const MAX_RETRIES: usize = 3;
 const WINDOW_CAP: usize = 4;
 const MAX_ACK_RECEIVED: i32 = 3;
 
+/// Handle to a connected client
 #[derive(Debug)]
-struct Inner {
-    start_stop: Notify,
-    sndbuf: Mutex<VecDeque<u8>>,
-    rcvbuf: Mutex<VecDeque<u8>>,
-    has_snd_data: Notify,
-    has_rcv_data: Notify,
-    window: Mutex<VecDeque<(u32, Vec<u8>)>>,
+pub struct UdpcpStream {
+    sock: UdpSocket,
+    /// Internal buffer used for sending and receiving frames
+    frame: [u8; MAX_PACKET_SIZE],
+    /// Current sequence number
+    seq: u32,
+    /// Last acked sequence number
+    ack_seq: u32,
+    /// Send window
+    window: VecDeque<(u32, Box<[u8]>)>,
 }
 
-#[derive(Debug)]
-pub struct TcpUdpStream(Arc<Inner>);
-
-impl TcpUdpStream {
+impl UdpcpStream {
     /// sock must be correctly configured
     fn new(sock: UdpSocket) -> Self {
-        let inner2 = Arc::new(Inner {
-            start_stop: Notify::new(),
-            sndbuf: Mutex::new(VecDeque::with_capacity(8 * MAX_PACKET_SIZE)),
-            rcvbuf: Mutex::new(VecDeque::with_capacity(8 * MAX_PACKET_SIZE)),
-            has_snd_data: Notify::new(),
-            has_rcv_data: Notify::new(),
-            window: Mutex::new(VecDeque::with_capacity(WINDOW_CAP)),
-        });
+        Self {
+            sock,
+            frame: [0; 1024],
+            seq: 0,
+            ack_seq: 0,
+            window: VecDeque::with_capacity(WINDOW_CAP),
+        }
+    }
 
-        let inner = inner2.clone();
-        task::spawn(async move {
-            let Inner {
-                start_stop,
-                sndbuf,
-                rcvbuf,
-                has_snd_data,
-                has_rcv_data,
-                window,
-            } = &*inner;
-
-            let mut frame = [0; MAX_PACKET_SIZE];
-            // TODO start seq at 1
-            let mut snd_seq = 0;
-            let mut last_successful_ack = 0;
-            let mut retransmit_threshold = MAX_ACK_RECEIVED;
-
-            // Event loop before the real one
-            // Raw udp traffic (no ack)
-            'before: loop {
-                select! {
-                    biased;
-                    _ = start_stop.notified() => {
-                        break 'before;
-                    }
-                    res = sock.recv(&mut frame) => {
-                        match res {
-                            Ok(n) => {
-                                let mut rcv = rcvbuf.lock().await;
-                                rcv.write(&frame[..n]).unwrap();
-                                has_rcv_data.notify_one();
-                            }
-                            Err(e) => {
-                                error!("Got error : {e}");
-                                return;
-                            }
-                        }
-                    }
-                    _ = has_snd_data.notified() => {
-                        let mut buf = sndbuf.lock().await;
-                        while buf.len() > 0 {
-                            let mut n = buf.read(&mut frame).unwrap();
-                            if n < frame.len() {
-                                n += buf.read(&mut frame[n..]).unwrap();
-                            }
-                            sock.send(&frame[..n]).await.unwrap();
-                        }
-                    }
-                }
-
-                if sndbuf.lock().await.len() > 0 {
-                    has_snd_data.notify_one();
-                }
+    /// Write to the stream, blocks for the data to arrive in the window
+    pub async fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let mut retransmit_threshold = MAX_ACK_RECEIVED;
+        'main: loop {
+            // Try sending a packet
+            while self.window.len() < self.window.capacity() {
+                let mut c = Cursor::new(&mut self.frame[..]);
+                write!(c, "{:0>6}", self.seq).unwrap();
+                let mut n = 6;
+                n += (MAX_PACKET_SIZE - 6).min(buf.len());
+                self.frame.copy_from_slice(&buf[..(n - 6)]);
+                // Append packet to window
+                self.window
+                    .push_back((self.seq, self.frame[..n].to_vec().into_boxed_slice()));
+                // Send packet
+                self.sock.send(&self.frame[..n]).await.unwrap();
+                debug!(n, seq = self.seq, "Sent bytes");
+                self.seq += 1;
             }
+            match self.sock.recv(&mut self.frame).await {
+                Ok(n) => {
+                    if n == 10 && &self.frame[..3] == b"ACK" {
+                        let ackseq: u32 = unsafe { from_utf8_unchecked(&self.frame[3..9]) }
+                            .parse()
+                            .unwrap();
 
-            'main: loop {
-                let window_len = window.lock().await.len();
-                debug!(window_len, "New loop");
-                select! {
-                    biased;
-                    _ = start_stop.notified() => {
-                        sock.send(b"FIN\0").await.unwrap();
-                        debug!("Sent FIN");
-                        break 'main;
-                    }
-                    res = sock.recv(&mut frame) => {
-                        match res {
-                            Ok(n) => {
-                                if n == 10 && &frame[..3] == b"ACK" {
-                                    let ackseq: u32 = String::from_utf8_lossy(&frame[3..9]).parse().unwrap();
-                                    debug!(seq = ackseq, "Received ACK");
+                        debug!(seq = ackseq, "Received ACK");
 
-                                    if ackseq == last_successful_ack {
-                                        if retransmit_threshold <= 0 {
-                                            let window = window.lock().await;
-                                            debug!(n = window.len(), "Retransmitting window");
-                                            for (_, packet) in window.iter() {
-                                                sock.send(packet).await.unwrap();
-                                            }
-                                            retransmit_threshold = MAX_ACK_RECEIVED;
-                                        } else {
-                                            retransmit_threshold -= 1;
-                                            debug!(dup = retransmit_threshold, "Duplicate ACK");
-                                        }
-                                    } else if ackseq < last_successful_ack {
-                                        debug!("Ignored ACK");
+                        if ackseq == self.ack_seq {
+                            if retransmit_threshold <= 0 {
+                                debug!(n = self.window.len(), "Retransmitting window");
+                                for (_, packet) in self.window.iter() {
+                                    self.sock.send(packet).await.unwrap();
+                                }
+                                retransmit_threshold = MAX_ACK_RECEIVED;
+                            } else {
+                                retransmit_threshold -= 1;
+                                debug!(dup = retransmit_threshold, "Duplicate ACK");
+                            }
+                        } else if ackseq < self.ack_seq {
+                            debug!("Ignored ACK");
+                        } else {
+                            loop {
+                                if let Some((seq, packet)) = self.window.pop_front() {
+                                    if ackseq >= seq {
+                                        debug!(seq, "Validated frame");
+                                        self.ack_seq = seq;
                                     } else {
-                                        let mut window = window.lock().await;
-                                        loop {
-                                            if let Some((seq, packet)) = window.pop_front() {
-                                                if ackseq >= seq {
-                                                    debug!(seq, "Validated frame");
-                                                    last_successful_ack = seq;
-                                                    continue;
-                                                } else {
-                                                    window.push_front((seq, packet));
-                                                    break;
-                                                }
-                                            } else {
-                                                debug!("Window empty !");
-                                                break;
-                                            }
-                                        }
+                                        self.window.push_front((seq, packet));
+                                        break;
                                     }
                                 } else {
-                                    error!("Received something other than an ACK");
+                                    error!("ACK while the window is empty ?");
+                                    break;
                                 }
                             }
-                            Err(e) => {
-                                error!("Got error : {e}");
-                                return;
-                            }
                         }
-                    }
-                    _ = has_snd_data.notified() => {
-                        let mut window = window.lock().await;
-                        if window.len() < WINDOW_CAP {
-                            debug!("Notified (send) !");
-                            let mut buf = sndbuf.lock().await;
-                            if buf.len() > 0 {
-                                let fmt = format!("{snd_seq:0>6}");
-                                let mut n = fmt.len();
-                                frame[..n].copy_from_slice(fmt.as_bytes());
-                                n += buf.read(&mut frame[n..]).unwrap();
-                                if n < frame.len() {
-                                    n += buf.read(&mut frame[n..]).unwrap();
-                                }
-                                // Append packet to window
-                                window.push_back((snd_seq, frame[..n].to_vec()));
-                                // Send packet
-                                sock.send(&frame[..n]).await.unwrap();
-                                debug!(n, seq = snd_seq, "Sent bytes");
-                                snd_seq += 1;
-                            } else {
-                                debug!("We got notified but no data in sndbuf");
-                            }
-                        } else {
-                            debug!("Window is full, not sending");
-                        }
+                    } else {
+                        error!("Received something other than an ACK");
                     }
                 }
-
-                let window = window.lock().await;
-                if window.len() < WINDOW_CAP && sndbuf.lock().await.len() > 0 {
-                    has_snd_data.notify_one();
-                }
-            }
-        });
-
-        TcpUdpStream(inner2)
-    }
-
-    pub async fn connect(ip: &str, port: u16) -> io::Result<Self> {
-        let sock = UdpSocket::bind((IpAddr::from([127, 0, 0, 1]), 0)).await?;
-        sock.connect((ip, port)).await?;
-        // Send SYN in a loop until we get SYNACK
-        let mut tries = 0;
-        let port = loop {
-            sock.send(b"SYN").await?;
-            tries += 1;
-            debug!("Sent SYN");
-            let mut buf = vec![0; 11];
-
-            // Wait for at most ACK_TIMEOUT
-            match timeout(ACK_TIMEOUT, sock.recv(&mut buf)).await {
-                Ok(Ok(n)) => {
-                    let msg = String::from_utf8_lossy(&buf[..n]);
-                    if !msg.starts_with("SYNACK") {
-                        error!("Received gibberish : {buf:?}");
-                        return Err(Error::from(ErrorKind::InvalidData));
-                    }
-                    // Extract port number
-                    dbg!(msg.clone());
-                    let port = msg[6..n].parse().expect("Invalid port number");
-                    debug!("Received SYNACK, data port is {port}");
-                    sock.send(b"ACK").await?;
-                    debug!("Sent ACK");
-                    break port;
-                }
-                Ok(Err(e)) => {
-                    error!("Got error: {e}");
+                Err(e) => {
+                    error!("Error while receiving : {e}");
                     return Err(e);
                 }
-                Err(_) => {
-                    if tries < MAX_RETRIES {
-                        debug!("SYNACK timeout, sending SYN again");
-                        continue;
-                    } else {
-                        error!("Retransmission limit reached");
-                        return Err(Error::from(ErrorKind::TimedOut));
-                    }
-                }
             }
-        };
-
-        // Connect the socket to the new port
-        sock.connect((ip, port)).await?;
-
-        Ok(Self::new(sock))
-    }
-
-    /// Write to the stream
-    pub async fn write(&self, buf: &[u8]) -> io::Result<usize> {
-        let mut snd = self.0.sndbuf.lock().await;
-        let n = snd.write(buf)?;
-        self.0.has_snd_data.notify_one();
-        Ok(n)
-    }
-
-    pub async fn flush(&self) {
-        // FIXME busy loop
-        while !self.0.sndbuf.lock().await.is_empty() || !self.0.window.lock().await.is_empty() {
-            task::yield_now().await;
         }
     }
 
     /// Read from the stream
     pub async fn read(&self, buf: &mut [u8]) -> io::Result<usize> {
-        if self.0.rcvbuf.lock().await.len() == 0 {
-            self.0.has_rcv_data.notified().await;
-            debug!("Notified (receive) !");
-        }
-        let mut rcv = self.0.rcvbuf.lock().await;
-        let mut n = rcv.read(buf)?;
-        if n < buf.len() {
-            n += rcv.read(&mut buf[n..])?;
-        }
-        Ok(n)
-    }
-
-    /// Start the main event loop, from there the connection is secured (ack and all)
-    pub fn start(&self) {
-        self.0.start_stop.notify_one()
-    }
-
-    /// Stop the main event loop, sending a FIN message
-    pub fn stop(&self) {
-        self.0.start_stop.notify_one()
-    }
-
-    pub async fn reliable<T>(&self, block: impl Future<Output = T>) -> T {
-        self.start();
-        let ret = block.await;
-        self.stop();
-        ret
+        self.sock.recv(buf).await
     }
 }
 
-pub struct TcpUdpListener {
+/// Handle to a server
+pub struct UdpcpListener {
     /// Used to get new clients from the acceptor loop
-    accept_rx: UnboundedReceiver<TcpUdpStream>,
+    accept_rx: UnboundedReceiver<UdpcpStream>,
 }
 
-impl TcpUdpListener {
+impl UdpcpListener {
     pub async fn bind(ip: &str, port: u16) -> io::Result<Self> {
         // If the channel was bounded, we would have a connection backlog limit
         let (tx, rx) = mpsc::unbounded_channel();
@@ -315,7 +141,7 @@ impl TcpUdpListener {
         Ok(Self { accept_rx: rx })
     }
 
-    async fn accept_loop(sock: UdpSocket, tx: UnboundedSender<TcpUdpStream>, mut next_port: u16) {
+    async fn accept_loop(sock: UdpSocket, tx: UnboundedSender<UdpcpStream>, mut next_port: u16) {
         // Clients we are having a handshake with
         let mut clients = HashMap::<SocketAddr, (Instant, UdpSocket)>::new();
         // Reception buffer
@@ -378,7 +204,7 @@ impl TcpUdpListener {
                 [b'A', b'C', b'K', 0] => {
                     if let Some((_, client)) = clients.remove(&client_addr) {
                         debug!("Received ACK from {client_addr}, handshake finished");
-                        tx.send(TcpUdpStream::new(client)).unwrap();
+                        tx.send(UdpcpStream::new(client)).unwrap();
                     } else {
                         error!("Unexpected ACK");
                         return;
@@ -390,7 +216,7 @@ impl TcpUdpListener {
                 }
             }
 
-            if clients.len() > 0 {
+            if !clients.is_empty() {
                 // Find the farthest instant in time
                 let mut oldest = Duration::from_secs(0);
                 for (_, (instant, _)) in clients.iter() {
@@ -403,7 +229,7 @@ impl TcpUdpListener {
         }
     }
 
-    pub async fn accept(&mut self) -> TcpUdpStream {
+    pub async fn accept(&mut self) -> UdpcpStream {
         self.accept_rx
             .recv()
             .await

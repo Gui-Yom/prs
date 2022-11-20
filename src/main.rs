@@ -1,17 +1,16 @@
 use plotly::common::{Line, LineShape, Mode, Title};
 use plotly::{Layout, Plot, Scatter};
+use stats::{StatsLayer, WindowStatsRecorder};
 use std::cell::RefCell;
-use std::fmt::Debug;
 use std::rc::Rc;
-use std::sync::{Arc, Mutex};
 use tokio::{fs, select, task};
-use tp3rs::stats::{StatsLayer, WindowStatsRecorder};
-use tp3rs::TcpUdpListener;
-use tracing::field::{Field, Visit};
-use tracing::{debug, info, info_span, Event, Instrument, Subscriber};
-use tracing_subscriber::layer::{Context, SubscriberExt};
+use tp3rs::UdpcpListener;
+use tracing::{debug, info};
+use tracing_subscriber::fmt;
+use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
-use tracing_subscriber::{fmt, Layer, Registry};
+
+pub mod stats;
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() {
@@ -23,7 +22,7 @@ async fn main() {
         .unwrap();
 
     let port = 5001;
-    let mut listener = TcpUdpListener::bind("0.0.0.0", port).await.unwrap();
+    let mut listener = UdpcpListener::bind("0.0.0.0", port).await.unwrap();
     info!("Listening on 0.0.0.0:{port}");
 
     //let buf = Arc::new(fs::read("Cargo.lock").await.unwrap());
@@ -31,30 +30,22 @@ async fn main() {
 
     let handler = async move {
         loop {
-            let client = listener.accept().await;
+            let mut client = listener.accept().await;
             //let bufr = buf.clone();
-            task::spawn(
-                async move {
-                    let buf = {
-                        let mut tmp = [0; 1024];
-                        let n = client.read(&mut tmp).await.unwrap();
-                        let fname = String::from_utf8_lossy(&tmp[..n - 1]).to_string();
-                        debug!(fname, "Received file name");
-                        fs::read(&fname).await.unwrap()
-                    };
+            task::spawn(async move {
+                let buf = {
+                    let mut tmp = [0; 1024];
+                    let n = client.read(&mut tmp).await.unwrap();
+                    let fname = String::from_utf8_lossy(&tmp[..n - 1]).to_string();
+                    debug!(fname, "Received file name");
+                    fs::read(&fname).await.unwrap()
+                };
 
-                    // TODO read file once (hashmap)
+                // TODO read file once (hashmap)
 
-                    client.start();
-
-                    client.write(&buf).await.unwrap();
-                    client.flush().await;
-                    info!("Copy finished");
-
-                    client.stop();
-                }
-                .instrument(info_span!("client task")),
-            );
+                client.write(&buf).await.unwrap();
+                info!("Copy finished");
+            });
         }
     };
 
