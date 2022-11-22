@@ -45,6 +45,7 @@ async fn main() {
 
                 client.write(&buf).await.unwrap();
                 info!("Copy finished");
+                client.stop().await;
             });
         }
     };

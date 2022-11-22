@@ -18,7 +18,7 @@ use tracing::{debug, error};
 const ACK_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_PACKET_SIZE: usize = 1024;
 const WINDOW_CAP: usize = 4;
-const MAX_ACK_RECEIVED: i32 = 3;
+const MAX_DUP_ACK: i32 = 2;
 
 /// Handle to a connected client
 #[derive(Debug)]
@@ -40,29 +40,38 @@ impl UdpcpStream {
         Self {
             sock,
             frame: [0; 1024],
-            seq: 0,
-            ack_seq: 0,
+            seq: 1,
+            ack_seq: 1,
             window: VecDeque::with_capacity(WINDOW_CAP),
         }
     }
 
     /// Write to the stream, blocks for the data to arrive in the window
     pub async fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        let mut retransmit_threshold = MAX_ACK_RECEIVED;
-        'main: loop {
-            // Try sending a packet
-            while self.window.len() < self.window.capacity() {
-                let mut c = Cursor::new(&mut self.frame[..]);
-                write!(c, "{:0>6}", self.seq).unwrap();
+        let mut ptr = buf;
+        let mut retransmit_threshold = MAX_DUP_ACK;
+        'main: while !ptr.is_empty() || !self.window.is_empty() {
+            // Try sending many frames
+            while self.window.len() < self.window.capacity() && !ptr.is_empty() {
+                // Write the sequence number
+                // Cursor because write! requires an impl of io::Write
+                write!(Cursor::new(&mut self.frame[..]), "{:0>6}", self.seq).unwrap();
                 let mut n = 6;
-                n += (MAX_PACKET_SIZE - 6).min(buf.len());
-                self.frame.copy_from_slice(&buf[..(n - 6)]);
+
+                // Write data to the frame
+                n += (MAX_PACKET_SIZE - 6).min(ptr.len());
+                self.frame[6..n].copy_from_slice(&ptr[..n - 6]);
+                ptr = &ptr[n - 6..];
+
                 // Append packet to window
                 self.window
                     .push_back((self.seq, self.frame[..n].to_vec().into_boxed_slice()));
+
                 // Send packet
                 self.sock.send(&self.frame[..n]).await.unwrap();
                 debug!(n, seq = self.seq, "Sent bytes");
+
+                // Increment next sequence number
                 self.seq += 1;
             }
             match self.sock.recv(&mut self.frame).await {
@@ -80,7 +89,7 @@ impl UdpcpStream {
                                 for (_, packet) in self.window.iter() {
                                     self.sock.send(packet).await.unwrap();
                                 }
-                                retransmit_threshold = MAX_ACK_RECEIVED;
+                                retransmit_threshold = MAX_DUP_ACK;
                             } else {
                                 retransmit_threshold -= 1;
                                 debug!(dup = retransmit_threshold, "Duplicate ACK");
@@ -88,17 +97,12 @@ impl UdpcpStream {
                         } else if ackseq < self.ack_seq {
                             debug!("Ignored ACK");
                         } else {
-                            loop {
-                                if let Some((seq, packet)) = self.window.pop_front() {
-                                    if ackseq >= seq {
-                                        debug!(seq, "Validated frame");
-                                        self.ack_seq = seq;
-                                    } else {
-                                        self.window.push_front((seq, packet));
-                                        break;
-                                    }
+                            while let Some((seq, packet)) = self.window.pop_front() {
+                                if ackseq >= seq {
+                                    debug!(seq, "Validated frame");
+                                    self.ack_seq = seq;
                                 } else {
-                                    error!("ACK while the window is empty ?");
+                                    self.window.push_front((seq, packet));
                                     break;
                                 }
                             }
@@ -113,11 +117,18 @@ impl UdpcpStream {
                 }
             }
         }
+        Ok(buf.len())
     }
 
     /// Read from the stream
     pub async fn read(&self, buf: &mut [u8]) -> io::Result<usize> {
         self.sock.recv(buf).await
+    }
+
+    /// Stop the connection by sending FIN
+    pub async fn stop(&mut self) {
+        self.sock.send(b"FIN").await.unwrap();
+        debug!("Sent FIN");
     }
 }
 
