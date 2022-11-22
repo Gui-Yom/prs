@@ -1,7 +1,10 @@
+use chrono::Utc;
 use std::cell::RefCell;
 use std::fmt::Debug;
+use std::ops::Add;
 use std::rc::Rc;
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 use tracing::field::{Field, Visit};
 use tracing::{Event, Subscriber};
 use tracing_subscriber::layer::Context;
@@ -50,15 +53,34 @@ impl<R: StatsRecorder + 'static, S: Subscriber> Layer<S> for StatsLayer<R> {
     }
 }
 
-#[derive(Default)]
-pub struct WindowStatsRecorder {
-    pub values: Vec<u64>,
+pub struct ThroughtputRecorder {
+    pub timestamps: Vec<chrono::DateTime<Utc>>,
+    pub values: Vec<u32>,
 }
 
-impl StatsRecorder for WindowStatsRecorder {
+impl Default for ThroughtputRecorder {
+    fn default() -> Self {
+        Self {
+            timestamps: Vec::with_capacity(4096),
+            values: Vec::with_capacity(4096),
+        }
+    }
+}
+
+impl StatsRecorder for ThroughtputRecorder {
     fn record_int(&mut self, field: &Field, value: i128) {
-        if "window_len" == field.name() {
-            self.values.push(value as u64);
+        if "sent" == field.name() {
+            if self
+                .timestamps
+                .last()
+                .map(|t| *t + chrono::Duration::milliseconds(50) < Utc::now())
+                .unwrap_or(true)
+            {
+                self.timestamps.push(Utc::now());
+                self.values.push(value as u32);
+            } else {
+                *self.values.last_mut().unwrap() += value as u32
+            }
         }
     }
 }

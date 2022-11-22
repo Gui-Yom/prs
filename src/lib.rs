@@ -13,11 +13,12 @@ use tokio::sync::mpsc;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio::task;
 use tokio::time::timeout;
-use tracing::{debug, error};
+use tracing::{debug, error, trace};
 
 const ACK_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_PACKET_SIZE: usize = 1024;
 const WINDOW_CAP: usize = 4;
+/// Max duplicate ACk to receive before retransmitting, must be < WINDOW_CAP - 1
 const MAX_DUP_ACK: i32 = 2;
 
 /// Handle to a connected client
@@ -25,13 +26,14 @@ const MAX_DUP_ACK: i32 = 2;
 pub struct UdpcpStream {
     sock: UdpSocket,
     /// Internal buffer used for sending and receiving frames
+    // TODO evaluate stack vs heap performance
     frame: [u8; MAX_PACKET_SIZE],
     /// Current sequence number
     seq: u32,
     /// Last acked sequence number
     ack_seq: u32,
-    /// Send window
-    window: VecDeque<(u32, Box<[u8]>)>,
+    /// Send window, frames are contiguous
+    window: VecDeque<(u32, usize, [u8; MAX_PACKET_SIZE])>,
 }
 
 impl UdpcpStream {
@@ -39,7 +41,7 @@ impl UdpcpStream {
     fn new(sock: UdpSocket) -> Self {
         Self {
             sock,
-            frame: [0; 1024],
+            frame: [0; MAX_PACKET_SIZE],
             seq: 1,
             ack_seq: 1,
             window: VecDeque::with_capacity(WINDOW_CAP),
@@ -48,9 +50,16 @@ impl UdpcpStream {
 
     /// Write to the stream, blocks for the data to arrive in the window
     pub async fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        // Remaining slice to be sent
         let mut ptr = buf;
-        let mut retransmit_threshold = MAX_DUP_ACK;
+        // Remaining duplicate ack to receive before retransmitting
+        let mut dup_ack = MAX_DUP_ACK;
+        let mut percent = 0.1;
         'main: while !ptr.is_empty() || !self.window.is_empty() {
+            if (buf.len() - ptr.len()) as f32 / buf.len() as f32 > percent {
+                debug!("Transfer at {:.3}%", percent * 100.0);
+                percent += 0.1;
+            }
             // Try sending many frames
             while self.window.len() < self.window.capacity() && !ptr.is_empty() {
                 // Write the sequence number
@@ -64,12 +73,11 @@ impl UdpcpStream {
                 ptr = &ptr[n - 6..];
 
                 // Append packet to window
-                self.window
-                    .push_back((self.seq, self.frame[..n].to_vec().into_boxed_slice()));
+                self.window.push_back((self.seq, n, self.frame));
 
                 // Send packet
                 self.sock.send(&self.frame[..n]).await.unwrap();
-                debug!(n, seq = self.seq, "Sent bytes");
+                trace!(sent = n, seq = self.seq, "Sent frame");
 
                 // Increment next sequence number
                 self.seq += 1;
@@ -81,28 +89,28 @@ impl UdpcpStream {
                             .parse()
                             .unwrap();
 
-                        debug!(seq = ackseq, "Received ACK");
+                        trace!(rseq = ackseq, "Received ACK");
 
                         if ackseq == self.ack_seq {
-                            if retransmit_threshold <= 0 {
-                                debug!(n = self.window.len(), "Retransmitting window");
-                                for (_, packet) in self.window.iter() {
-                                    self.sock.send(packet).await.unwrap();
+                            if dup_ack <= 0 {
+                                trace!(n = self.window.len(), "Retransmitting window");
+                                for (_, len, buf) in self.window.iter() {
+                                    self.sock.send(&buf[..*len]).await.unwrap();
                                 }
-                                retransmit_threshold = MAX_DUP_ACK;
+                                dup_ack = MAX_DUP_ACK;
                             } else {
-                                retransmit_threshold -= 1;
-                                debug!(dup = retransmit_threshold, "Duplicate ACK");
+                                dup_ack -= 1;
+                                trace!("Duplicate ACK");
                             }
                         } else if ackseq < self.ack_seq {
-                            debug!("Ignored ACK");
+                            trace!("Ignored ACK");
                         } else {
-                            while let Some((seq, packet)) = self.window.pop_front() {
-                                if ackseq >= seq {
-                                    debug!(seq, "Validated frame");
-                                    self.ack_seq = seq;
+                            while let Some((seq, _, _)) = self.window.front() {
+                                if ackseq >= *seq {
+                                    trace!(vseq = seq, "Validated frame");
+                                    self.ack_seq = *seq;
+                                    self.window.pop_front();
                                 } else {
-                                    self.window.push_front((seq, packet));
                                     break;
                                 }
                             }
@@ -194,10 +202,9 @@ impl UdpcpListener {
                         // Update connection state
                         *instant = Instant::now();
                     } else {
-                        dbg!(next_port);
                         let synack = format!("SYN-ACK{next_port}\0");
                         sock.send_to(synack.as_bytes(), client_addr).await.unwrap();
-                        debug!("Sent SYNACK to {client_addr}");
+                        debug!("Sent {synack} to {client_addr}");
 
                         // Create the local udp socket at the moment we send SYN-ACK
                         let client = UdpSocket::bind((IpAddr::from([0, 0, 0, 0]), next_port))

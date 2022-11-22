@@ -1,23 +1,31 @@
 use plotly::common::{Line, LineShape, Mode, Title};
+use plotly::layout::{Axis, RangeSlider};
 use plotly::{Layout, Plot, Scatter};
-use stats::{StatsLayer, WindowStatsRecorder};
+use stats::{StatsLayer, ThroughtputRecorder};
 use std::cell::RefCell;
 use std::rc::Rc;
 use tokio::{fs, select, task};
 use tp3rs::UdpcpListener;
 use tracing::{debug, info};
-use tracing_subscriber::fmt;
+use tracing_subscriber::filter::LevelFilter;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
+use tracing_subscriber::{fmt, EnvFilter, Layer};
 
 pub mod stats;
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() {
-    let recorder = Rc::new(RefCell::new(WindowStatsRecorder::default()));
+    let recorder = Rc::new(RefCell::new(ThroughtputRecorder::default()));
     tracing_subscriber::registry()
-        .with(fmt::layer().compact())
         .with(StatsLayer::new(recorder.clone()))
+        .with(
+            fmt::layer().compact().with_filter(
+                EnvFilter::builder()
+                    .with_default_directive(LevelFilter::DEBUG.into())
+                    .from_env_lossy(),
+            ),
+        )
         .try_init()
         .unwrap();
 
@@ -31,10 +39,11 @@ async fn main() {
     let handler = async move {
         loop {
             let mut client = listener.accept().await;
+            info!("New client !");
             //let bufr = buf.clone();
             task::spawn(async move {
                 let buf = {
-                    let mut tmp = [0; 1024];
+                    let mut tmp = [0; 256];
                     let n = client.read(&mut tmp).await.unwrap();
                     let fname = String::from_utf8_lossy(&tmp[..n - 1]).to_string();
                     debug!(fname, "Received file name");
@@ -56,17 +65,19 @@ async fn main() {
     }
 
     let trace = Scatter::new(
-        (0..recorder.borrow().values.len()).collect(),
+        recorder.borrow().timestamps.clone(),
         recorder.borrow().values.clone(),
     )
     .mode(Mode::Lines)
-    .name("window size")
+    .name("throughtput")
     .line(Line::new().shape(LineShape::Hv));
 
     let mut plot = Plot::new();
     plot.add_trace(trace);
 
-    let layout = Layout::new().title(Title::new("Window size over time"));
+    let layout = Layout::new()
+        .x_axis(Axis::new().range_slider(RangeSlider::new().visible(true)))
+        .title(Title::new("Throughput over time"));
     plot.set_layout(layout);
 
     plot.write_html("graph.html");
