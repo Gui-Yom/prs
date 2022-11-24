@@ -1,10 +1,9 @@
 use chrono::Utc;
 use std::cell::RefCell;
 use std::fmt::Debug;
-use std::ops::Add;
+use std::ops::DerefMut;
 use std::rc::Rc;
 use std::sync::Mutex;
-use std::time::{Duration, Instant};
 use tracing::field::{Field, Visit};
 use tracing::{Event, Subscriber};
 use tracing_subscriber::layer::Context;
@@ -12,6 +11,7 @@ use tracing_subscriber::Layer;
 
 pub trait StatsRecorder {
     fn record_int(&mut self, _field: &Field, _value: i128) {}
+    fn record_str(&mut self, _field: &Field, _value: &str) {}
 }
 
 /// Trait adapter
@@ -36,6 +36,10 @@ impl<R: StatsRecorder> Visit for VisitWrapper<R> {
         (*self.0).borrow_mut().record_int(field, value as i128);
     }
 
+    fn record_str(&mut self, field: &Field, value: &str) {
+        StatsRecorder::record_str((*self.0).borrow_mut().deref_mut(), field, value);
+    }
+
     fn record_debug(&mut self, _field: &Field, _value: &dyn Debug) {}
 }
 
@@ -55,7 +59,7 @@ impl<R: StatsRecorder + 'static, S: Subscriber> Layer<S> for StatsLayer<R> {
 
 pub struct ThroughtputRecorder {
     pub timestamps: Vec<chrono::DateTime<Utc>>,
-    pub values: Vec<u32>,
+    pub values: Vec<f32>,
 }
 
 impl Default for ThroughtputRecorder {
@@ -73,14 +77,55 @@ impl StatsRecorder for ThroughtputRecorder {
             if self
                 .timestamps
                 .last()
-                .map(|t| *t + chrono::Duration::milliseconds(50) < Utc::now())
+                .map(|t| *t + chrono::Duration::milliseconds(10) < Utc::now())
                 .unwrap_or(true)
             {
                 self.timestamps.push(Utc::now());
-                self.values.push(value as u32);
+                if let Some(last) = self.values.last_mut() {
+                    *last /= 0.010 * 1024.0;
+                }
+                self.values.push(value as f32);
             } else {
-                *self.values.last_mut().unwrap() += value as u32
+                *self.values.last_mut().unwrap() += value as f32
             }
+        }
+    }
+}
+
+pub struct TraceRecorder {
+    pub ack_timestamps: Vec<chrono::DateTime<Utc>>,
+    pub acks: Vec<u32>,
+    pub frame_timestamps: Vec<chrono::DateTime<Utc>>,
+    pub frames: Vec<u32>,
+    pub lost_timestamps: Vec<chrono::DateTime<Utc>>,
+    pub losses: Vec<u32>,
+}
+
+impl Default for TraceRecorder {
+    fn default() -> Self {
+        Self {
+            ack_timestamps: Vec::with_capacity(1 << 15),
+            acks: Vec::with_capacity(1 << 15),
+            frame_timestamps: Vec::with_capacity(1 << 15),
+            frames: Vec::with_capacity(1 << 15),
+            lost_timestamps: Vec::with_capacity(1024),
+            losses: Vec::with_capacity(1024),
+        }
+    }
+}
+
+impl StatsRecorder for TraceRecorder {
+    fn record_int(&mut self, field: &Field, value: i128) {
+        match field.name() {
+            "rseq" => {
+                self.ack_timestamps.push(Utc::now());
+                self.acks.push(value as u32);
+            }
+            "lost" => {
+                self.lost_timestamps.push(Utc::now());
+                self.losses.push(value as u32);
+            }
+            _ => {}
         }
     }
 }

@@ -1,7 +1,7 @@
-use plotly::common::{Line, LineShape, Mode, Title};
+use plotly::common::{Marker, MarkerSymbol, Mode, Title};
 use plotly::layout::{Axis, RangeSlider};
 use plotly::{Layout, Plot, Scatter};
-use stats::{StatsLayer, ThroughtputRecorder};
+use stats::StatsLayer;
 use std::cell::RefCell;
 use std::rc::Rc;
 use tokio::{fs, select, task};
@@ -16,9 +16,16 @@ pub mod stats;
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() {
-    let recorder = Rc::new(RefCell::new(ThroughtputRecorder::default()));
-    tracing_subscriber::registry()
-        .with(StatsLayer::new(recorder.clone()))
+    //let throughput_recorder = Rc::new(RefCell::new(ThroughtputRecorder::default()));
+    #[cfg(feature = "trace")]
+    let trace_recorder = Rc::new(RefCell::new(stats::TraceRecorder::default()));
+
+    let registry = tracing_subscriber::registry();
+    //.with(StatsLayer::new(throughput_recorder.clone()))
+    #[cfg(feature = "trace")]
+    let registry = registry.with(StatsLayer::new(trace_recorder.clone()));
+
+    registry
         .with(
             fmt::layer().compact().with_filter(
                 EnvFilter::builder()
@@ -33,14 +40,11 @@ async fn main() {
     let mut listener = UdpcpListener::bind("0.0.0.0", port).await.unwrap();
     info!("Listening on 0.0.0.0:{port}");
 
-    //let buf = Arc::new(fs::read("Cargo.lock").await.unwrap());
-    //debug!("File is {} bytes", buf.len());
-
     let handler = async move {
         loop {
             let mut client = listener.accept().await;
             info!("New client !");
-            //let bufr = buf.clone();
+
             task::spawn(async move {
                 let buf = {
                     let mut tmp = [0; 256];
@@ -64,21 +68,45 @@ async fn main() {
         _ = tokio::signal::ctrl_c() => {}
     }
 
-    let trace = Scatter::new(
-        recorder.borrow().timestamps.clone(),
-        recorder.borrow().values.clone(),
-    )
-    .mode(Mode::Lines)
-    .name("throughtput")
-    .line(Line::new().shape(LineShape::Hv));
+    #[cfg(feature = "trace")]
+    {
+        /*
+            let throughput = Scatter::new(
+                throughput_recorder.borrow().timestamps.clone(),
+                throughput_recorder.borrow().values.clone(),
+            )
+            .mode(Mode::Lines)
+            .name("Throughtput (kB/s)")
+            .line(Line::new().shape(LineShape::Hv));
+        */
+        let losses = Scatter::new(
+            trace_recorder.borrow().lost_timestamps.clone(),
+            trace_recorder.borrow().losses.clone(),
+        )
+        .mode(Mode::Markers)
+        .marker(Marker::new().symbol(MarkerSymbol::Cross))
+        .name("Losses");
 
-    let mut plot = Plot::new();
-    plot.add_trace(trace);
+        let acks = Scatter::new(
+            trace_recorder.borrow().ack_timestamps.clone(),
+            trace_recorder.borrow().acks.clone(),
+        )
+        .web_gl_mode(true)
+        .mode(Mode::Markers)
+        .marker(Marker::new().symbol(MarkerSymbol::Cross))
+        .name("ACK");
 
-    let layout = Layout::new()
-        .x_axis(Axis::new().range_slider(RangeSlider::new().visible(true)))
-        .title(Title::new("Throughput over time"));
-    plot.set_layout(layout);
+        // Plot
+        let mut plot = Plot::new();
+        //plot.add_trace(throughput);
+        plot.add_trace(losses);
+        plot.add_trace(acks);
 
-    plot.write_html("graph.html");
+        let layout = Layout::new()
+            .x_axis(Axis::new().range_slider(RangeSlider::new().visible(true)))
+            .title(Title::new("Transfer trace"));
+        plot.set_layout(layout);
+
+        plot.write_html("graph.html");
+    }
 }

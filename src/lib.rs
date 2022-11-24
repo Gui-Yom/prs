@@ -1,10 +1,10 @@
 //! UDP control protocol unidirectional server library
 //! Fully asynchronous API
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::io;
-use std::io::Cursor;
 use std::io::Write;
+use std::io::{Cursor, ErrorKind};
 use std::net::{IpAddr, SocketAddr};
 use std::str::from_utf8_unchecked;
 use std::time::{Duration, Instant};
@@ -16,10 +16,13 @@ use tokio::time::timeout;
 use tracing::{debug, error, trace};
 
 const ACK_TIMEOUT: Duration = Duration::from_secs(5);
-const MAX_PACKET_SIZE: usize = 1024;
-const WINDOW_CAP: usize = 4;
+const HEADER_SIZE: usize = 6;
+const MAX_PACKET_SIZE: usize = 1460;
+const DATA_SIZE: usize = MAX_PACKET_SIZE - HEADER_SIZE;
+/// Window size
+const WINDOW_SIZE: usize = 80;
 /// Max duplicate ACk to receive before retransmitting, must be < WINDOW_CAP - 1
-const MAX_DUP_ACK: i32 = 2;
+const MAX_DUP_ACK: i32 = 3;
 
 /// Handle to a connected client
 #[derive(Debug)]
@@ -28,12 +31,6 @@ pub struct UdpcpStream {
     /// Internal buffer used for sending and receiving frames
     // TODO evaluate stack vs heap performance
     frame: [u8; MAX_PACKET_SIZE],
-    /// Current sequence number
-    seq: u32,
-    /// Last acked sequence number
-    ack_seq: u32,
-    /// Send window, frames are contiguous
-    window: VecDeque<(u32, usize, [u8; MAX_PACKET_SIZE])>,
 }
 
 impl UdpcpStream {
@@ -42,86 +39,117 @@ impl UdpcpStream {
         Self {
             sock,
             frame: [0; MAX_PACKET_SIZE],
-            seq: 1,
-            ack_seq: 1,
-            window: VecDeque::with_capacity(WINDOW_CAP),
         }
     }
 
-    /// Write to the stream, blocks for the data to arrive in the window
+    /// Format a frame for sending
+    async fn send_frame(&mut self, seq: usize, data: &[u8]) -> usize {
+        // Write the sequence number
+        // Cursor because write! requires an impl of io::Write
+        write!(
+            Cursor::new(&mut self.frame[..]),
+            "{:0>1$}",
+            seq,
+            HEADER_SIZE
+        )
+        .unwrap();
+
+        // Write data to the frame
+        let data_len = DATA_SIZE.min(data[seq * DATA_SIZE..].len());
+        self.frame[HEADER_SIZE..data_len + HEADER_SIZE]
+            .copy_from_slice(&data[seq * DATA_SIZE..seq * DATA_SIZE + data_len]);
+        self.sock
+            .send(&self.frame[..HEADER_SIZE + data_len])
+            .await
+            .unwrap();
+        data_len
+    }
+
+    /// Write to the stream, suspends until all data is received by the peer correctly (empty window)
     pub async fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        // Remaining slice to be sent
-        let mut ptr = buf;
+        let mut seq = 0;
+        let mut acked: i32 = -1;
+        //let max_seq = buf.len() / DATA_SIZE;
+        //let remaining = buf.len() % DATA_SIZE;
         // Remaining duplicate ack to receive before retransmitting
         let mut dup_ack = MAX_DUP_ACK;
+
+        // Send window
+        let mut window = 0;
+
         let mut percent = 0.1;
-        'main: while !ptr.is_empty() || !self.window.is_empty() {
-            if (buf.len() - ptr.len()) as f32 / buf.len() as f32 > percent {
+
+        while seq * DATA_SIZE < buf.len() || window != 0 {
+            // Quick update
+            if (seq * DATA_SIZE) as f32 / buf.len() as f32 > percent {
                 debug!("Transfer at {:.3}%", percent * 100.0);
                 percent += 0.1;
             }
-            // Try sending many frames
-            while self.window.len() < self.window.capacity() && !ptr.is_empty() {
-                // Write the sequence number
-                // Cursor because write! requires an impl of io::Write
-                write!(Cursor::new(&mut self.frame[..]), "{:0>6}", self.seq).unwrap();
-                let mut n = 6;
 
-                // Write data to the frame
-                n += (MAX_PACKET_SIZE - 6).min(ptr.len());
-                self.frame[6..n].copy_from_slice(&ptr[..n - 6]);
-                ptr = &ptr[n - 6..];
+            // Try sending many frames
+            while seq * DATA_SIZE < buf.len() && window < WINDOW_SIZE {
+                // Create the frame to send
+                let data_len = self.send_frame(seq, buf).await;
+                trace!(sent = data_len, seq, "Sent frame");
 
                 // Append packet to window
-                self.window.push_back((self.seq, n, self.frame));
-
-                // Send packet
-                self.sock.send(&self.frame[..n]).await.unwrap();
-                trace!(sent = n, seq = self.seq, "Sent frame");
+                window += 1;
 
                 // Increment next sequence number
-                self.seq += 1;
+                seq += 1;
             }
-            match self.sock.recv(&mut self.frame).await {
-                Ok(n) => {
-                    if n == 10 && &self.frame[..3] == b"ACK" {
-                        let ackseq: u32 = unsafe { from_utf8_unchecked(&self.frame[3..9]) }
-                            .parse()
-                            .unwrap();
 
-                        trace!(rseq = ackseq, "Received ACK");
+            // At this point, either the window is full or we don't have anymore data to send
+            // Just wait for an ack to arrive
+            'recv: loop {
+                // TODO timeout !!!!!!!!!!!!
+                match self.sock.try_recv(&mut self.frame) {
+                    Ok(n) => {
+                        if n == 10 && &self.frame[..3] == b"ACK" {
+                            // Read the ack sequence number
+                            let ack = unsafe { from_utf8_unchecked(&self.frame[3..9]) }
+                                .parse()
+                                .unwrap();
+                            trace!(rseq = ack, "Received ACK");
 
-                        if ackseq == self.ack_seq {
-                            if dup_ack <= 0 {
-                                trace!(n = self.window.len(), "Retransmitting window");
-                                for (_, len, buf) in self.window.iter() {
-                                    self.sock.send(&buf[..*len]).await.unwrap();
-                                }
-                                dup_ack = MAX_DUP_ACK;
-                            } else {
-                                dup_ack -= 1;
-                                trace!("Duplicate ACK");
-                            }
-                        } else if ackseq < self.ack_seq {
-                            trace!("Ignored ACK");
-                        } else {
-                            while let Some((seq, _, _)) = self.window.front() {
-                                if ackseq >= *seq {
-                                    trace!(vseq = seq, "Validated frame");
-                                    self.ack_seq = *seq;
-                                    self.window.pop_front();
+                            if ack == acked {
+                                // This ack was already received
+                                if dup_ack <= 0 {
+                                    // Exceeded duplicate ack counter
+                                    trace!(lost = ack + 1, "Retransmitting window");
+                                    // Retransmit the whole window
+                                    for w in 0..window {
+                                        // Create the frame to send
+                                        let seq = acked as usize + w + 1;
+                                        let _ = self.send_frame(seq, buf).await;
+                                    }
+                                    // Reset the counter
+                                    dup_ack = MAX_DUP_ACK;
                                 } else {
-                                    break;
+                                    dup_ack -= 1;
+                                    trace!("Duplicate ACK");
                                 }
+                            } else if ack < acked {
+                                // This ack is outdated
+                                trace!("Ignored ACK");
+                            } else {
+                                // Valid ack sequence number
+                                // Validate everything until this ack
+                                //debug!(window, ack, acked, "help pls");
+                                window -= (ack as i32 - acked) as usize;
+                                acked = ack;
                             }
+                        } else {
+                            error!("Received something other than an ACK");
                         }
-                    } else {
-                        error!("Received something other than an ACK");
                     }
-                }
-                Err(e) => {
-                    error!("Error while receiving : {e}");
-                    return Err(e);
+                    Err(e) if e.kind() == ErrorKind::WouldBlock => {
+                        break 'recv;
+                    }
+                    Err(e) => {
+                        error!("Error while receiving : {e}");
+                        return Err(e);
+                    }
                 }
             }
         }
