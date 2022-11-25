@@ -22,7 +22,11 @@ const DATA_SIZE: usize = MAX_PACKET_SIZE - HEADER_SIZE;
 /// Window size
 const WINDOW_SIZE: usize = 80;
 /// Max duplicate ACk to receive before retransmitting, must be < WINDOW_CAP - 1
-const MAX_DUP_ACK: i32 = 3;
+const MAX_DUP_ACK: i32 = 1;
+/// Weight of past srtt estimations
+const SRTT_ALPHA: f64 = 0.9;
+// TODO find the right value
+const SRTT_MAX: Duration = Duration::from_millis(1);
 
 /// Handle to a connected client
 #[derive(Debug)]
@@ -79,6 +83,8 @@ impl UdpcpStream {
         let mut dup_ack = MAX_DUP_ACK;
         let mut instants = VecDeque::with_capacity(WINDOW_SIZE);
 
+        let mut srtt = Duration::from_millis(1);
+
         let mut percent = 0.1;
 
         while (seq - 1) * DATA_SIZE < buf.len() || window != 0 {
@@ -102,7 +108,7 @@ impl UdpcpStream {
                 seq += 1;
             }
 
-            if instants.front().unwrap().elapsed() > Duration::from_millis(1) {
+            if instants.front().unwrap().elapsed() > srtt {
                 trace!(
                     timeout = acked + 1,
                     "Timeout expired, retranmitting oldest packet"
@@ -150,8 +156,16 @@ impl UdpcpStream {
                                 let num = (ack as i32 - acked) as usize;
                                 window -= num;
                                 for _ in 0..num {
-                                    instants.pop_front();
+                                    let instant = instants.pop_front().unwrap();
+                                    srtt = Duration::from_micros(
+                                        (SRTT_ALPHA * srtt.as_micros() as f64
+                                            + (1.0 - SRTT_ALPHA)
+                                                * instant.elapsed().as_micros() as f64)
+                                            as u64,
+                                    )
+                                    .min(SRTT_MAX);
                                 }
+                                trace!(srtt = srtt.as_micros(), "Recalculating srtt");
                                 acked = ack;
                             }
                         } else {

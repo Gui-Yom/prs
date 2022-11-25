@@ -1,5 +1,5 @@
 use plotly::common::{Marker, MarkerSymbol, Mode, Title};
-use plotly::layout::{Axis, RangeSlider};
+use plotly::layout::{Axis, GridPattern, LayoutGrid, RangeSlider, RowOrder};
 use plotly::{Layout, Plot, Scatter};
 use stats::StatsLayer;
 use std::cell::RefCell;
@@ -19,6 +19,7 @@ async fn main() {
     //let throughput_recorder = Rc::new(RefCell::new(ThroughtputRecorder::default()));
     #[cfg(feature = "trace")]
     let trace_recorder = Rc::new(RefCell::new(stats::TraceRecorder::default()));
+    let srtt_recorder = Rc::new(RefCell::new(stats::SrttRecorder::default()));
 
     let registry = tracing_subscriber::registry();
     //.with(StatsLayer::new(throughput_recorder.clone()))
@@ -26,6 +27,7 @@ async fn main() {
     let registry = registry.with(StatsLayer::new(trace_recorder.clone()));
 
     registry
+        .with(StatsLayer::new(srtt_recorder.clone()))
         .with(
             fmt::layer().compact().with_filter(
                 EnvFilter::builder()
@@ -96,13 +98,28 @@ async fn main() {
         .marker(Marker::new().symbol(MarkerSymbol::Cross))
         .name("ACK");
 
+        let srtt = Scatter::new(
+            srtt_recorder.borrow().timestamps.clone(),
+            srtt_recorder.borrow().values.clone(),
+        )
+        .mode(Mode::Lines)
+        .name("SRTT");
+
         // Plot
         let mut plot = Plot::new();
         //plot.add_trace(throughput);
         plot.add_trace(losses);
         plot.add_trace(acks);
+        plot.add_trace(srtt);
 
         let layout = Layout::new()
+            .grid(
+                LayoutGrid::new()
+                    .rows(2)
+                    .columns(1)
+                    .pattern(GridPattern::Independent)
+                    .row_order(RowOrder::TopToBottom),
+            )
             .x_axis(Axis::new().range_slider(RangeSlider::new().visible(true)))
             .title(Title::new("Transfer trace"));
         plot.set_layout(layout);

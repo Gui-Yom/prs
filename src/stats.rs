@@ -129,3 +129,26 @@ impl StatsRecorder for TraceRecorder {
         }
     }
 }
+
+pub struct SrttRecorder {
+    pub timestamps: Vec<chrono::DateTime<Utc>>,
+    pub values: Vec<u64>,
+}
+
+impl Default for SrttRecorder {
+    fn default() -> Self {
+        Self {
+            timestamps: Vec::with_capacity(4096),
+            values: Vec::with_capacity(4096),
+        }
+    }
+}
+
+impl StatsRecorder for SrttRecorder {
+    fn record_int(&mut self, field: &Field, value: i128) {
+        if "srtt" == field.name() {
+            self.timestamps.push(Utc::now());
+            self.values.push(value as u64);
+        }
+    }
+}
