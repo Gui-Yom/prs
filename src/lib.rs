@@ -1,7 +1,7 @@
 //! UDP control protocol unidirectional server library
 //! Fully asynchronous API
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::io::Write;
 use std::io::{Cursor, ErrorKind};
@@ -17,7 +17,7 @@ use tracing::{debug, error, trace};
 
 const ACK_TIMEOUT: Duration = Duration::from_secs(5);
 const HEADER_SIZE: usize = 6;
-const MAX_PACKET_SIZE: usize = 1460;
+const MAX_PACKET_SIZE: usize = 1472;
 const DATA_SIZE: usize = MAX_PACKET_SIZE - HEADER_SIZE;
 /// Window size
 const WINDOW_SIZE: usize = 80;
@@ -55,9 +55,9 @@ impl UdpcpStream {
         .unwrap();
 
         // Write data to the frame
-        let data_len = DATA_SIZE.min(data[seq * DATA_SIZE..].len());
+        let data_len = DATA_SIZE.min(data[(seq - 1) * DATA_SIZE..].len());
         self.frame[HEADER_SIZE..data_len + HEADER_SIZE]
-            .copy_from_slice(&data[seq * DATA_SIZE..seq * DATA_SIZE + data_len]);
+            .copy_from_slice(&data[(seq - 1) * DATA_SIZE..(seq - 1) * DATA_SIZE + data_len]);
         self.sock
             .send(&self.frame[..HEADER_SIZE + data_len])
             .await
@@ -67,29 +67,32 @@ impl UdpcpStream {
 
     /// Write to the stream, suspends until all data is received by the peer correctly (empty window)
     pub async fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        let mut seq = 0;
-        let mut acked: i32 = -1;
+        let mut seq = 1;
+        let mut acked: i32 = 0;
         //let max_seq = buf.len() / DATA_SIZE;
         //let remaining = buf.len() % DATA_SIZE;
-        // Remaining duplicate ack to receive before retransmitting
-        let mut dup_ack = MAX_DUP_ACK;
 
         // Send window
         let mut window = 0;
 
+        // Remaining duplicate ack to receive before retransmitting
+        let mut dup_ack = MAX_DUP_ACK;
+        let mut instants = VecDeque::with_capacity(WINDOW_SIZE);
+
         let mut percent = 0.1;
 
-        while seq * DATA_SIZE < buf.len() || window != 0 {
+        while (seq - 1) * DATA_SIZE < buf.len() || window != 0 {
             // Quick update
-            if (seq * DATA_SIZE) as f32 / buf.len() as f32 > percent {
+            if ((seq - 1) * DATA_SIZE) as f32 / buf.len() as f32 > percent {
                 debug!("Transfer at {:.3}%", percent * 100.0);
                 percent += 0.1;
             }
 
             // Try sending many frames
-            while seq * DATA_SIZE < buf.len() && window < WINDOW_SIZE {
+            while (seq - 1) * DATA_SIZE < buf.len() && window < WINDOW_SIZE {
                 // Create the frame to send
                 let data_len = self.send_frame(seq, buf).await;
+                instants.push_back(Instant::now());
                 trace!(sent = data_len, seq, "Sent frame");
 
                 // Append packet to window
@@ -99,10 +102,18 @@ impl UdpcpStream {
                 seq += 1;
             }
 
+            if instants.front().unwrap().elapsed() > Duration::from_millis(1) {
+                trace!(
+                    timeout = acked + 1,
+                    "Timeout expired, retranmitting oldest packet"
+                );
+                let _ = self.send_frame((acked + 1) as usize, buf).await;
+                *instants.get_mut(0).unwrap() = Instant::now();
+            }
+
             // At this point, either the window is full or we don't have anymore data to send
             // Just wait for an ack to arrive
             'recv: loop {
-                // TODO timeout !!!!!!!!!!!!
                 match self.sock.try_recv(&mut self.frame) {
                     Ok(n) => {
                         if n == 10 && &self.frame[..3] == b"ACK" {
@@ -115,13 +126,13 @@ impl UdpcpStream {
                             if ack == acked {
                                 // This ack was already received
                                 if dup_ack <= 0 {
-                                    // Exceeded duplicate ack counter
-                                    trace!(lost = ack + 1, "Retransmitting window");
-                                    // Retransmit the whole window
-                                    for w in 0..window {
-                                        // Create the frame to send
-                                        let seq = acked as usize + w + 1;
-                                        let _ = self.send_frame(seq, buf).await;
+                                    if window > 0 {
+                                        // Exceeded duplicate ack counter
+                                        // We only retransmit the packet we know has been lost
+                                        trace!(lost = ack + 1, "Retransmitting lost packet");
+                                        let _ = self.send_frame((ack + 1) as usize, buf).await;
+                                        *instants.get_mut((ack - acked) as usize).unwrap() =
+                                            Instant::now();
                                     }
                                     // Reset the counter
                                     dup_ack = MAX_DUP_ACK;
@@ -136,7 +147,11 @@ impl UdpcpStream {
                                 // Valid ack sequence number
                                 // Validate everything until this ack
                                 //debug!(window, ack, acked, "help pls");
-                                window -= (ack as i32 - acked) as usize;
+                                let num = (ack as i32 - acked) as usize;
+                                window -= num;
+                                for _ in 0..num {
+                                    instants.pop_front();
+                                }
                                 acked = ack;
                             }
                         } else {
