@@ -26,7 +26,9 @@ const MAX_DUP_ACK: i32 = 1;
 /// Weight of past srtt estimations
 const SRTT_ALPHA: f64 = 0.9;
 // TODO find the right value
-const SRTT_MAX: Duration = Duration::from_millis(1);
+// Random timeout between 1 and 9 ms
+const SRTT_START: Duration = Duration::from_millis(3);
+const SRTT_MAX: Duration = Duration::from_millis(5);
 
 /// Handle to a connected client
 #[derive(Debug)]
@@ -83,7 +85,8 @@ impl UdpcpStream {
         let mut dup_ack = MAX_DUP_ACK;
         let mut instants = VecDeque::with_capacity(WINDOW_SIZE);
 
-        let mut srtt = Duration::from_millis(1);
+        let mut srtt = SRTT_START;
+        trace!(srtt = srtt.as_micros(), "Initial srtt value");
 
         let mut percent = 0.1;
 
@@ -95,6 +98,8 @@ impl UdpcpStream {
             }
 
             // Try sending many frames
+            //let start = Instant::now();
+            //let old_seq = seq;
             while (seq - 1) * DATA_SIZE < buf.len() && window < WINDOW_SIZE {
                 // Create the frame to send
                 let data_len = self.send_frame(seq, buf).await;
@@ -107,18 +112,18 @@ impl UdpcpStream {
                 // Increment next sequence number
                 seq += 1;
             }
-
-            if instants.front().unwrap().elapsed() > srtt {
-                trace!(
-                    timeout = acked + 1,
-                    "Timeout expired, retranmitting oldest packet"
+            /*
+            if seq - old_seq > 0 {
+                debug!(
+                    "Write delay ({} packets) : {} µs",
+                    seq - old_seq,
+                    start.elapsed().as_micros()
                 );
-                let _ = self.send_frame((acked + 1) as usize, buf).await;
-                *instants.get_mut(0).unwrap() = Instant::now();
-            }
+            }*/
 
-            // At this point, either the window is full or we don't have anymore data to send
-            // Just wait for an ack to arrive
+            // Receive acks in batch
+            // Only process those who were already received by the network stack
+            // Notice the use of a non blocking try_recv
             'recv: loop {
                 match self.sock.try_recv(&mut self.frame) {
                     Ok(n) => {
@@ -135,7 +140,7 @@ impl UdpcpStream {
                                     if window > 0 {
                                         // Exceeded duplicate ack counter
                                         // We only retransmit the packet we know has been lost
-                                        trace!(lost = ack + 1, "Retransmitting lost packet");
+                                        trace!(dupack = ack + 1, "Retransmitting lost packet");
                                         let _ = self.send_frame((ack + 1) as usize, buf).await;
                                         *instants.get_mut((ack - acked) as usize).unwrap() =
                                             Instant::now();
@@ -180,6 +185,20 @@ impl UdpcpStream {
                         return Err(e);
                     }
                 }
+            }
+
+            // Check timeouts
+            if instants
+                .front()
+                .map(|i| i.elapsed() > srtt)
+                .unwrap_or(false)
+            {
+                trace!(
+                    timeout = acked + 1,
+                    "Timeout expired, retransmitting oldest packet"
+                );
+                let _ = self.send_frame((acked + 1) as usize, buf).await;
+                *instants.get_mut(0).unwrap() = Instant::now();
             }
         }
         Ok(buf.len())
