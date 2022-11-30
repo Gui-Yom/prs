@@ -2,11 +2,11 @@
 
 UDP control protocol unidirectional server implementation.
 
-## Requirements
+## Building and running
 
 Cargo and a rust toolchain must be installed.
 
-## Running
+### Running
 
 ```shell
 git clone https://github.com/Gui-Yom/prs
@@ -14,7 +14,24 @@ cd prs
 cargo run
 ```
 
-## Perte des paquets
+### Graphs and data
+
+The application can automatically generate graphs thanks to plotly.
+Compile with the `trace` feature to capture trace data and generate graphs.
+
+```shell
+cargo run --features trace
+```
+
+### Optimized release build
+
+For a release, build the program with optimizations and remove trace calls at compile time :
+
+```shell
+cargo run --release --features tracing/release_max_level_debug
+```
+
+## Reverse engineered packet drop function
 
 ```c
 /* Retourne vrai si le message doit être perdu */
@@ -38,3 +55,7 @@ bool drop_message(double debitMo,double *seuil,int seq) {
   return (double)(tirage % 100) / 100.0 < dropRate;
 }
 ```
+
+## Current performances
+
+Best throughput : 11.1 MB/s

@@ -1,9 +1,3 @@
-use plotly::common::{Marker, MarkerSymbol, Mode, Title};
-use plotly::layout::{Axis, GridPattern, LayoutGrid, RangeSlider, RowOrder};
-use plotly::{Layout, Plot, Scatter};
-use stats::StatsLayer;
-use std::cell::RefCell;
-use std::rc::Rc;
 use tokio::{fs, select, task};
 use tp3rs::UdpcpListener;
 use tracing::{debug, info};
@@ -12,22 +6,26 @@ use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{fmt, EnvFilter, Layer};
 
-pub mod stats;
+#[cfg(feature = "trace")]
+pub mod metrics;
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() {
-    //let throughput_recorder = Rc::new(RefCell::new(ThroughtputRecorder::default()));
-    #[cfg(feature = "trace")]
-    let trace_recorder = Rc::new(RefCell::new(stats::TraceRecorder::default()));
-    let srtt_recorder = Rc::new(RefCell::new(stats::SrttRecorder::default()));
-
     let registry = tracing_subscriber::registry();
-    //.with(StatsLayer::new(throughput_recorder.clone()))
+
+    // Register matrics
     #[cfg(feature = "trace")]
-    let registry = registry.with(StatsLayer::new(trace_recorder.clone()));
+    let (srtt_metric, trace_recorder, registry) = {
+        let srtt_layer = metrics::MetricLayer::<metrics::SrttMetric>::new();
+        let trace_layer = metrics::MetricLayer::<metrics::TraceRecorder>::new();
+        (
+            srtt_layer.metric(),
+            trace_layer.metric(),
+            registry.with(srtt_layer).with(trace_layer),
+        )
+    };
 
     registry
-        .with(StatsLayer::new(srtt_recorder.clone()))
         .with(
             fmt::layer().compact().with_filter(
                 EnvFilter::builder()
@@ -43,10 +41,12 @@ async fn main() {
     info!("Listening on 0.0.0.0:{port}");
 
     let handler = async move {
+        // Acceptor loop
         loop {
             let mut client = listener.accept().await;
             info!("New client !");
 
+            // Client's task
             task::spawn(async move {
                 let buf = {
                     let mut tmp = [0; 256];
@@ -65,64 +65,83 @@ async fn main() {
         }
     };
 
+    // Cancel the acceptor loop on ctrl-c
     select! {
         _ = handler => {}
         _ = tokio::signal::ctrl_c() => {}
     }
 
+    // Generate graphs before exiting
+
     #[cfg(feature = "trace")]
     {
-        /*
-            let throughput = Scatter::new(
-                throughput_recorder.borrow().timestamps.clone(),
-                throughput_recorder.borrow().values.clone(),
+        use plotly::common::{AxisSide, Marker, MarkerSymbol, Mode, Title};
+        use plotly::configuration::{ImageButtonFormats, ToImageButtonOptions};
+        use plotly::layout::{Axis, RangeSlider};
+        use plotly::Configuration;
+        use plotly::{Layout, Plot, Scatter};
+
+        // https://plotly.com/javascript/plotly-fundamentals/
+        // https://igiagkiozis.github.io/plotly/content/recipes/subplots/multiple_axes.html
+
+        let (sent, ack, dup, to) = {
+            let trace = trace_recorder.lock().unwrap();
+            (
+                Scatter::new(trace.timestamps_sent.clone(), trace.sent.clone())
+                    .mode(Mode::Markers)
+                    .web_gl_mode(true)
+                    .marker(Marker::new().symbol(MarkerSymbol::Cross))
+                    .name("Sent"),
+                Scatter::new(trace.timestamps_ack.clone(), trace.acks.clone())
+                    .mode(Mode::Markers)
+                    .web_gl_mode(true)
+                    .marker(Marker::new().symbol(MarkerSymbol::AsteriskOpen))
+                    .name("ACK received"),
+                Scatter::new(trace.timestamps_dup.clone(), trace.dup.clone())
+                    .mode(Mode::Markers)
+                    .web_gl_mode(true)
+                    .name("Retransmit (dup acks)"),
+                Scatter::new(trace.timestamps_to.clone(), trace.to.clone())
+                    .mode(Mode::Markers)
+                    .web_gl_mode(true)
+                    .name("Retransmit (timeouts)"),
             )
-            .mode(Mode::Lines)
-            .name("Throughtput (kB/s)")
-            .line(Line::new().shape(LineShape::Hv));
-        */
-        let losses = Scatter::new(
-            trace_recorder.borrow().lost_timestamps.clone(),
-            trace_recorder.borrow().losses.clone(),
-        )
-        .mode(Mode::Markers)
-        .marker(Marker::new().symbol(MarkerSymbol::Cross))
-        .name("Losses");
+        };
 
-        let acks = Scatter::new(
-            trace_recorder.borrow().ack_timestamps.clone(),
-            trace_recorder.borrow().acks.clone(),
-        )
-        .web_gl_mode(true)
-        .mode(Mode::Markers)
-        .marker(Marker::new().symbol(MarkerSymbol::Cross))
-        .name("ACK");
-
-        let srtt = Scatter::new(
-            srtt_recorder.borrow().timestamps.clone(),
-            srtt_recorder.borrow().values.clone(),
-        )
-        .mode(Mode::Lines)
-        .name("SRTT");
+        let srtt = {
+            let srtt = srtt_metric.lock().unwrap();
+            Scatter::new(srtt.timestamps.clone(), srtt.values.clone())
+                .mode(Mode::Lines)
+                .name("SRTT")
+                .y_axis("y2")
+        };
 
         // Plot
         let mut plot = Plot::new();
-        //plot.add_trace(throughput);
-        plot.add_trace(losses);
-        plot.add_trace(acks);
         plot.add_trace(srtt);
+        plot.add_traces(vec![sent, ack, dup, to]);
 
-        let layout = Layout::new()
-            .grid(
-                LayoutGrid::new()
-                    .rows(2)
-                    .columns(1)
-                    .pattern(GridPattern::Independent)
-                    .row_order(RowOrder::TopToBottom),
-            )
-            .x_axis(Axis::new().range_slider(RangeSlider::new().visible(true)))
-            .title(Title::new("Transfer trace"));
-        plot.set_layout(layout);
+        plot.set_layout(
+            Layout::new()
+                .y_axis(Axis::new().title(Title::new("sequence number")))
+                .y_axis2(
+                    Axis::new()
+                        .title(Title::new("SRTT (µs)"))
+                        .overlaying("y")
+                        .side(AxisSide::Right)
+                        .domain(&[0., 5000.]),
+                )
+                .x_axis(Axis::new().range_slider(RangeSlider::new().visible(true)))
+                .title(Title::new("Transfer trace")),
+        );
+
+        plot.set_configuration(
+            Configuration::new()
+                .fill_frame(true)
+                .to_image_button_options(
+                    ToImageButtonOptions::new().format(ImageButtonFormats::Svg),
+                ),
+        );
 
         plot.write_html("graph.html");
     }

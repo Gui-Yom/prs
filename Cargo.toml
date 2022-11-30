@@ -9,8 +9,9 @@ edition = "2021"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tokio = { version = "1", features = ["full"] }
-plotly = "0.8"
-chrono = { version = "0.4", features = ["serde"] }
+plotly = { version = "0.8", optional = true }
+chrono = { version = "0.4", features = ["serde"], optional = true }
 
 [features]
-trace = []
+# Record data for graphs and insights
+trace = ["plotly", "chrono"]
