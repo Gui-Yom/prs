@@ -1,3 +1,4 @@
+use plotly::common::{Line, LineShape};
 use tokio::{fs, select, task};
 use tp3rs::UdpcpListener;
 use tracing::{debug, info};
@@ -15,13 +16,18 @@ async fn main() {
 
     // Register matrics
     #[cfg(feature = "trace")]
-    let (srtt_metric, trace_recorder, registry) = {
+    let (srtt_metric, trace_recorder, throughput_metric, registry) = {
         let srtt_layer = metrics::MetricLayer::<metrics::SrttMetric>::new();
         let trace_layer = metrics::MetricLayer::<metrics::TraceRecorder>::new();
+        let throughput_layer = metrics::MetricLayer::<metrics::ThroughputMetric>::new();
         (
             srtt_layer.metric(),
             trace_layer.metric(),
-            registry.with(srtt_layer).with(trace_layer),
+            throughput_layer.metric(),
+            registry
+                .with(srtt_layer)
+                .with(trace_layer)
+                .with(throughput_layer),
         )
     };
 
@@ -112,14 +118,28 @@ async fn main() {
             let srtt = srtt_metric.lock().unwrap();
             Scatter::new(srtt.timestamps.clone(), srtt.values.clone())
                 .mode(Mode::Lines)
+                .web_gl_mode(true)
                 .name("SRTT")
                 .y_axis("y2")
+        };
+
+        let throughput = {
+            let mut throughput = throughput_metric.lock().unwrap();
+            throughput.timestamps.pop();
+            throughput.values.pop();
+            Scatter::new(throughput.timestamps.clone(), throughput.values.clone())
+                .mode(Mode::Lines)
+                .web_gl_mode(true)
+                .line(Line::new().shape(LineShape::Hv))
+                .name("Throughput")
+                .y_axis("y3")
         };
 
         // Plot
         let mut plot = Plot::new();
         plot.add_trace(srtt);
         plot.add_traces(vec![sent, ack, dup, to]);
+        plot.add_trace(throughput);
 
         plot.set_layout(
             Layout::new()
@@ -131,7 +151,13 @@ async fn main() {
                         .side(AxisSide::Right)
                         .domain(&[0., 5000.]),
                 )
-                .x_axis(Axis::new().range_slider(RangeSlider::new().visible(true)))
+                .y_axis3(
+                    Axis::new()
+                        .title(Title::new("Throughput (Mo/s)"))
+                        .overlaying("y")
+                        .side(AxisSide::Left),
+                )
+                //.x_axis(Axis::new().range_slider(RangeSlider::new().visible(true)))
                 .title(Title::new("Transfer trace")),
         );
 
@@ -140,9 +166,16 @@ async fn main() {
                 .fill_frame(true)
                 .to_image_button_options(
                     ToImageButtonOptions::new().format(ImageButtonFormats::Svg),
-                ),
+                )
+                .scroll_zoom(true),
         );
 
         plot.write_html("graph.html");
     }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn test_this() {}
 }

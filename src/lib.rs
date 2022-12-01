@@ -20,7 +20,7 @@ const HEADER_SIZE: usize = 6;
 const MAX_PACKET_SIZE: usize = 1472;
 const DATA_SIZE: usize = MAX_PACKET_SIZE - HEADER_SIZE;
 /// Window size
-const WINDOW_SIZE: usize = 80;
+const WINDOW_SIZE: usize = 99;
 /// Max duplicate ACk to receive before retransmitting, must be < WINDOW_CAP - 1
 const MAX_DUP_ACK: i32 = 1;
 /// Weight of past srtt estimations
@@ -29,6 +29,7 @@ const SRTT_ALPHA: f64 = 0.9;
 // Random timeout between 1 and 9 ms
 const SRTT_START: Duration = Duration::from_millis(3);
 const SRTT_MAX: Duration = Duration::from_millis(5);
+const ACK_TIMEOUT_MANUAL: Duration = Duration::from_millis(5);
 
 /// Handle to a connected client
 #[derive(Debug)]
@@ -190,7 +191,7 @@ impl UdpcpStream {
             // Check timeouts
             if instants
                 .front()
-                .map(|i| i.elapsed() > srtt)
+                .map(|i| i.elapsed() > ACK_TIMEOUT_MANUAL)
                 .unwrap_or(false)
             {
                 trace!(
