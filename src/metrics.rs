@@ -1,8 +1,8 @@
-use chrono::{DateTime, Utc};
-
 use std::fmt::Debug;
-
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use chrono::{DateTime, Utc};
 use tracing::field::{Field, Visit};
 use tracing::{Event, Subscriber};
 use tracing_subscriber::layer::Context;
@@ -155,6 +155,34 @@ impl Metric for SrttMetric {
         if "srtt" == field.name() {
             self.timestamps.push(Utc::now());
             self.values.push(value as u64);
+        }
+    }
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Debug)]
+pub struct Data {
+    pub execution_time: std::time::Duration,
+    pub throughput_mo: f32,
+    pub timestamps_msg: Vec<DateTime<Utc>>,
+    pub msgs: Vec<u32>,
+    pub timestamps_drop: Vec<DateTime<Utc>>,
+    pub drops: Vec<u32>,
+    pub timestamps_ack: Vec<DateTime<Utc>>,
+    pub acks: Vec<u32>,
+}
+
+impl Data {
+    /// Const fn impl to use in statics
+    pub const fn new() -> Self {
+        Data {
+            execution_time: Duration::ZERO,
+            throughput_mo: 0.0,
+            timestamps_msg: Vec::new(),
+            msgs: Vec::new(),
+            timestamps_drop: Vec::new(),
+            drops: Vec::new(),
+            timestamps_ack: Vec::new(),
+            acks: Vec::new(),
         }
     }
 }

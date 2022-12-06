@@ -1,17 +1,27 @@
+[workspace]
+members = ["injection"]
+
 [package]
-name = "tp3rs"
+name = "udcp"
 version = "0.1.0"
 edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
+[profile.release]
+opt-level = 3
+lto = "thin"
+
 [dependencies]
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tokio = { version = "1", features = ["full"] }
+spin_sleep = "1"
+serde = { version = "1", optional = true }
+bincode = { version = "1", optional = true }
+chrono = { version = "0.4", default-features = false, features = ["std", "clock", "serde"], optional = true }
 plotly = { version = "0.8", optional = true }
-chrono = { version = "0.4", features = ["serde"], optional = true }
 
 [features]
 # Record data for graphs and insights
-trace = ["plotly", "chrono"]
+trace = ["serde", "bincode", "chrono", "plotly"]

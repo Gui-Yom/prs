@@ -1,13 +1,14 @@
-//! UDP control protocol unidirectional server library
-//! Fully asynchronous API
+//! User datagram control protocol unidirectional server library
+//! Asynchronous API
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::io;
 use std::io::Write;
 use std::io::{Cursor, ErrorKind};
 use std::net::{IpAddr, SocketAddr};
 use std::str::from_utf8_unchecked;
 use std::time::{Duration, Instant};
+
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
@@ -15,12 +16,15 @@ use tokio::task;
 use tokio::time::timeout;
 use tracing::{debug, error, trace};
 
+#[cfg(feature = "trace")]
+pub mod metrics;
+
 const ACK_TIMEOUT: Duration = Duration::from_secs(5);
 const HEADER_SIZE: usize = 6;
 const MAX_PACKET_SIZE: usize = 1472;
 const DATA_SIZE: usize = MAX_PACKET_SIZE - HEADER_SIZE;
 /// Window size
-const WINDOW_SIZE: usize = 99;
+const WINDOW_SIZE: usize = 70;
 /// Max duplicate ACk to receive before retransmitting, must be < WINDOW_CAP - 1
 const MAX_DUP_ACK: i32 = 1;
 /// Weight of past srtt estimations
@@ -29,18 +33,19 @@ const SRTT_ALPHA: f64 = 0.9;
 // Random timeout between 1 and 9 ms
 const SRTT_START: Duration = Duration::from_millis(3);
 const SRTT_MAX: Duration = Duration::from_millis(5);
-const ACK_TIMEOUT_MANUAL: Duration = Duration::from_millis(5);
+const ACK_TIMEOUT_MANUAL: Duration = Duration::from_millis(4);
+const SEND_DELAY: Duration = Duration::from_micros(20);
 
 /// Handle to a connected client
 #[derive(Debug)]
-pub struct UdpcpStream {
+pub struct UdcpStream {
     sock: UdpSocket,
     /// Internal buffer used for sending and receiving frames
     // TODO evaluate stack vs heap performance
     frame: [u8; MAX_PACKET_SIZE],
 }
 
-impl UdpcpStream {
+impl UdcpStream {
     /// sock must be correctly configured
     fn new(sock: UdpSocket) -> Self {
         Self {
@@ -74,17 +79,17 @@ impl UdpcpStream {
 
     /// Write to the stream, suspends until all data is received by the peer correctly (empty window)
     pub async fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        // Next sequence number to be sent
         let mut seq = 1;
+        // Last acked sequence number (back of the window)
         let mut acked: i32 = 0;
-        //let max_seq = buf.len() / DATA_SIZE;
-        //let remaining = buf.len() % DATA_SIZE;
-
         // Send window
         let mut window = 0;
 
         // Remaining duplicate ack to receive before retransmitting
         let mut dup_ack = MAX_DUP_ACK;
-        let mut instants = VecDeque::with_capacity(WINDOW_SIZE);
+        let mut ack_wave = 0;
+        let mut next_timeout = Instant::now();
 
         let mut srtt = SRTT_START;
         trace!(srtt = srtt.as_micros(), "Initial srtt value");
@@ -99,28 +104,30 @@ impl UdpcpStream {
             }
 
             // Try sending many frames
-            //let start = Instant::now();
-            //let old_seq = seq;
             while (seq - 1) * DATA_SIZE < buf.len() && window < WINDOW_SIZE {
                 // Create the frame to send
                 let data_len = self.send_frame(seq, buf).await;
-                instants.push_back(Instant::now());
                 trace!(sent = data_len, seq, "Sent frame");
+
+                // Only set the timeout if it's the first packet we are sending
+                // The timeout is then controlled by the retransmission algorithms
+                if window == 0 {
+                    next_timeout = Instant::now() + ACK_TIMEOUT_MANUAL;
+                }
 
                 // Append packet to window
                 window += 1;
-
                 // Increment next sequence number
                 seq += 1;
+
+                /*
+                spin_sleep::SpinSleeper::new(SEND_DELAY.subsec_nanos())
+                    .with_spin_strategy(SpinStrategy::SpinLoopHint)
+                    .sleep(SEND_DELAY);*/
+
+                // Going through the loop acts as a delay
+                break;
             }
-            /*
-            if seq - old_seq > 0 {
-                debug!(
-                    "Write delay ({} packets) : {} µs",
-                    seq - old_seq,
-                    start.elapsed().as_micros()
-                );
-            }*/
 
             // Receive acks in batch
             // Only process those who were already received by the network stack
@@ -136,21 +143,19 @@ impl UdpcpStream {
                             trace!(rseq = ack, "Received ACK");
 
                             if ack == acked {
-                                // This ack was already received
-                                if dup_ack <= 0 {
-                                    if window > 0 {
+                                if ack_wave == ack {
+                                    dup_ack -= 1;
+                                } else {
+                                    dup_ack = seq as i32 - ack - 1;
+                                    ack_wave = ack;
+
+                                    if dup_ack <= 0 && window > 0 {
                                         // Exceeded duplicate ack counter
                                         // We only retransmit the packet we know has been lost
                                         trace!(dupack = ack + 1, "Retransmitting lost packet");
                                         let _ = self.send_frame((ack + 1) as usize, buf).await;
-                                        *instants.get_mut((ack - acked) as usize).unwrap() =
-                                            Instant::now();
+                                        next_timeout = Instant::now() + ACK_TIMEOUT_MANUAL;
                                     }
-                                    // Reset the counter
-                                    dup_ack = MAX_DUP_ACK;
-                                } else {
-                                    dup_ack -= 1;
-                                    trace!("Duplicate ACK");
                                 }
                             } else if ack < acked {
                                 // This ack is outdated
@@ -161,18 +166,15 @@ impl UdpcpStream {
                                 //debug!(window, ack, acked, "help pls");
                                 let num = (ack as i32 - acked) as usize;
                                 window -= num;
-                                for _ in 0..num {
-                                    let instant = instants.pop_front().unwrap();
-                                    srtt = Duration::from_micros(
-                                        (SRTT_ALPHA * srtt.as_micros() as f64
-                                            + (1.0 - SRTT_ALPHA)
-                                                * instant.elapsed().as_micros() as f64)
-                                            as u64,
-                                    )
-                                    .min(SRTT_MAX);
-                                }
-                                trace!(srtt = srtt.as_micros(), "Recalculating srtt");
                                 acked = ack;
+                                if window > 0 {
+                                    trace!(
+                                        anticipation = ack + 1,
+                                        "Retransmit in anticipation of packet loss"
+                                    );
+                                    let _ = self.send_frame((ack + 1) as usize, buf).await;
+                                    next_timeout = Instant::now() + ACK_TIMEOUT_MANUAL;
+                                }
                             }
                         } else {
                             error!("Received something other than an ACK");
@@ -188,18 +190,14 @@ impl UdpcpStream {
                 }
             }
 
-            // Check timeouts
-            if instants
-                .front()
-                .map(|i| i.elapsed() > ACK_TIMEOUT_MANUAL)
-                .unwrap_or(false)
-            {
+            // Check timeout
+            if Instant::now() > next_timeout && window > 0 {
                 trace!(
                     timeout = acked + 1,
-                    "Timeout expired, retransmitting oldest packet"
+                    "Timeout expired, retransmitting packet"
                 );
                 let _ = self.send_frame((acked + 1) as usize, buf).await;
-                *instants.get_mut(0).unwrap() = Instant::now();
+                next_timeout = Instant::now() + ACK_TIMEOUT_MANUAL;
             }
         }
         Ok(buf.len())
@@ -218,12 +216,12 @@ impl UdpcpStream {
 }
 
 /// Handle to a server
-pub struct UdpcpListener {
+pub struct UdcpListener {
     /// Used to get new clients from the acceptor loop
-    accept_rx: UnboundedReceiver<UdpcpStream>,
+    accept_rx: UnboundedReceiver<UdcpStream>,
 }
 
-impl UdpcpListener {
+impl UdcpListener {
     pub async fn bind(ip: &str, port: u16) -> io::Result<Self> {
         // If the channel was bounded, we would have a connection backlog limit
         let (tx, rx) = mpsc::unbounded_channel();
@@ -237,7 +235,7 @@ impl UdpcpListener {
         Ok(Self { accept_rx: rx })
     }
 
-    async fn accept_loop(sock: UdpSocket, tx: UnboundedSender<UdpcpStream>, mut next_port: u16) {
+    async fn accept_loop(sock: UdpSocket, tx: UnboundedSender<UdcpStream>, mut next_port: u16) {
         // Clients we are having a handshake with
         let mut clients = HashMap::<SocketAddr, (Instant, UdpSocket)>::new();
         // Reception buffer
@@ -299,7 +297,7 @@ impl UdpcpListener {
                 [b'A', b'C', b'K', 0] => {
                     if let Some((_, client)) = clients.remove(&client_addr) {
                         debug!("Received ACK from {client_addr}, handshake finished");
-                        tx.send(UdpcpStream::new(client)).unwrap();
+                        tx.send(UdcpStream::new(client)).unwrap();
                     } else {
                         error!("Unexpected ACK");
                         return;
@@ -324,7 +322,7 @@ impl UdpcpListener {
         }
     }
 
-    pub async fn accept(&mut self) -> UdpcpStream {
+    pub async fn accept(&mut self) -> UdcpStream {
         self.accept_rx
             .recv()
             .await
