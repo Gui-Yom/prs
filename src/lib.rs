@@ -19,12 +19,13 @@ use tracing::{debug, error, trace};
 #[cfg(feature = "trace")]
 pub mod metrics;
 
-const ACK_TIMEOUT: Duration = Duration::from_secs(5);
-const HEADER_SIZE: usize = 6;
+/// MTU - IP header - UDP header
 const MAX_PACKET_SIZE: usize = 1472;
+/// Sequence number spanning 6 ascii chars
+const HEADER_SIZE: usize = 6;
 const DATA_SIZE: usize = MAX_PACKET_SIZE - HEADER_SIZE;
 /// Window size
-const WINDOW_SIZE: usize = 70;
+const WINDOW_SIZE: usize = 80;
 /// Max duplicate ACk to receive before retransmitting, must be < WINDOW_CAP - 1
 const MAX_DUP_ACK: i32 = 1;
 /// Weight of past srtt estimations
@@ -33,8 +34,9 @@ const SRTT_ALPHA: f64 = 0.9;
 // Random timeout between 1 and 9 ms
 const SRTT_START: Duration = Duration::from_millis(3);
 const SRTT_MAX: Duration = Duration::from_millis(5);
-const ACK_TIMEOUT_MANUAL: Duration = Duration::from_millis(4);
-const SEND_DELAY: Duration = Duration::from_micros(20);
+const ACK_TIMEOUT_MANUAL: Duration = Duration::from_micros(1100);
+/// Rate limiting
+const SEND_DELAY: Duration = Duration::from_micros(70);
 
 /// Handle to a connected client
 #[derive(Debug)]
@@ -91,8 +93,10 @@ impl UdcpStream {
         let mut ack_wave = 0;
         let mut next_timeout = Instant::now();
 
-        let mut srtt = SRTT_START;
-        trace!(srtt = srtt.as_micros(), "Initial srtt value");
+        let mut rate_limiter = Instant::now();
+
+        //let mut srtt = SRTT_START;
+        //trace!(srtt = srtt.as_micros(), "Initial srtt value");
 
         let mut percent = 0.1;
 
@@ -105,27 +109,27 @@ impl UdcpStream {
 
             // Try sending many frames
             while (seq - 1) * DATA_SIZE < buf.len() && window < WINDOW_SIZE {
-                // Create the frame to send
-                let data_len = self.send_frame(seq, buf).await;
-                trace!(sent = data_len, seq, "Sent frame");
+                if rate_limiter.elapsed() > SEND_DELAY {
+                    // Create the frame to send
+                    let data_len = self.send_frame(seq, buf).await;
+                    trace!(sent = data_len, seq, "Sent frame");
 
-                // Only set the timeout if it's the first packet we are sending
-                // The timeout is then controlled by the retransmission algorithms
-                if window == 0 {
-                    next_timeout = Instant::now() + ACK_TIMEOUT_MANUAL;
+                    // Only set the timeout if it's the first packet we are sending
+                    // The timeout is then controlled by the retransmission algorithms
+                    if window == 0 {
+                        next_timeout = Instant::now() + ACK_TIMEOUT_MANUAL;
+                    }
+
+                    // Append packet to window
+                    window += 1;
+                    // Increment next sequence number
+                    seq += 1;
+
+                    rate_limiter = Instant::now();
                 }
 
-                // Append packet to window
-                window += 1;
-                // Increment next sequence number
-                seq += 1;
-
-                /*
-                spin_sleep::SpinSleeper::new(SEND_DELAY.subsec_nanos())
-                    .with_spin_strategy(SpinStrategy::SpinLoopHint)
-                    .sleep(SEND_DELAY);*/
-
-                // Going through the loop acts as a delay
+                // Precise sleeping is achieved via spinning. At least we try to spin usefully.
+                // Going through the whole loop acts as a short delay.
                 break;
             }
 
@@ -143,6 +147,8 @@ impl UdcpStream {
                             trace!(rseq = ack, "Received ACK");
 
                             if ack == acked {
+                                // No mechanism here
+                                /*
                                 if ack_wave == ack {
                                     dup_ack -= 1;
                                 } else {
@@ -152,11 +158,11 @@ impl UdcpStream {
                                     if dup_ack <= 0 && window > 0 {
                                         // Exceeded duplicate ack counter
                                         // We only retransmit the packet we know has been lost
-                                        trace!(dupack = ack + 1, "Retransmitting lost packet");
+                                        debug!(dupack = ack + 1, "Retransmitting lost packet");
                                         let _ = self.send_frame((ack + 1) as usize, buf).await;
                                         next_timeout = Instant::now() + ACK_TIMEOUT_MANUAL;
                                     }
-                                }
+                                }*/
                             } else if ack < acked {
                                 // This ack is outdated
                                 trace!("Ignored ACK");
@@ -215,6 +221,8 @@ impl UdcpStream {
     }
 }
 
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Handle to a server
 pub struct UdcpListener {
     /// Used to get new clients from the acceptor loop
@@ -253,7 +261,7 @@ impl UdcpListener {
                 }
                 Err(_) => {
                     for (addr, (instant, client)) in clients.iter_mut() {
-                        if instant.elapsed() >= ACK_TIMEOUT {
+                        if instant.elapsed() >= HANDSHAKE_TIMEOUT {
                             debug!("ACK timeout for client {addr}, sending SYNACK again");
                             let synack =
                                 format!("SYN-ACK{}\0", client.local_addr().unwrap().port());
@@ -315,7 +323,7 @@ impl UdcpListener {
                 for (_, (instant, _)) in clients.iter() {
                     oldest = oldest.max(instant.elapsed());
                 }
-                wait = ACK_TIMEOUT - oldest.min(ACK_TIMEOUT);
+                wait = HANDSHAKE_TIMEOUT - oldest.min(HANDSHAKE_TIMEOUT);
             } else {
                 wait = Duration::from_secs(u64::MAX);
             }

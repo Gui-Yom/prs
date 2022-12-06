@@ -91,8 +91,8 @@ pub struct TraceRecorder {
     pub acks: Vec<u32>,
     pub timestamps_sent: Vec<DateTime<Utc>>,
     pub sent: Vec<u32>,
-    pub timestamps_dup: Vec<DateTime<Utc>>,
-    pub dup: Vec<u32>,
+    pub timestamps_anticip: Vec<DateTime<Utc>>,
+    pub anticip: Vec<u32>,
     pub timestamps_to: Vec<DateTime<Utc>>,
     pub to: Vec<u32>,
 }
@@ -104,8 +104,8 @@ impl Default for TraceRecorder {
             acks: Vec::with_capacity(1 << 15),
             timestamps_sent: Vec::with_capacity(1 << 15),
             sent: Vec::with_capacity(1 << 15),
-            timestamps_dup: Vec::with_capacity(1 << 12),
-            dup: Vec::with_capacity(1 << 12),
+            timestamps_anticip: Vec::with_capacity(1 << 12),
+            anticip: Vec::with_capacity(1 << 12),
             timestamps_to: Vec::with_capacity(1 << 12),
             to: Vec::with_capacity(1 << 12),
         }
@@ -123,9 +123,9 @@ impl Metric for TraceRecorder {
                 self.timestamps_ack.push(Utc::now());
                 self.acks.push(value as u32);
             }
-            "dupack" => {
-                self.timestamps_dup.push(Utc::now());
-                self.dup.push(value as u32);
+            "anticipation" => {
+                self.timestamps_anticip.push(Utc::now());
+                self.anticip.push(value as u32);
             }
             "timeout" => {
                 self.timestamps_to.push(Utc::now());
@@ -161,7 +161,7 @@ impl Metric for SrttMetric {
 
 #[derive(serde::Serialize, serde::Deserialize, Debug)]
 pub struct Data {
-    pub execution_time: std::time::Duration,
+    pub execution_time: Duration,
     pub throughput_mo: f32,
     pub timestamps_msg: Vec<DateTime<Utc>>,
     pub msgs: Vec<u32>,

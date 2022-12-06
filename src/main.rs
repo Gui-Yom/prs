@@ -1,5 +1,6 @@
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
 use tokio::io::AsyncReadExt;
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
@@ -10,10 +11,10 @@ use tracing_subscriber::filter::LevelFilter;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{fmt, EnvFilter, Layer};
-use udcp::UdcpListener;
 
 #[cfg(feature = "trace")]
 use udcp::metrics;
+use udcp::UdcpListener;
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() {
@@ -80,7 +81,13 @@ async fn main() {
                     let n = client.read(&mut tmp).await.unwrap();
                     let fname = String::from_utf8_lossy(&tmp[..n - 1]).to_string();
                     debug!(fname, "Received file name");
-                    fs::read(&fname).await.unwrap()
+                    let start = Instant::now();
+                    let tmp = fs::read(&fname).await.unwrap();
+                    debug!(
+                        "Reading the whole file took {} ms",
+                        start.elapsed().as_millis()
+                    );
+                    tmp
                 };
 
                 // TODO read file once (hashmap)
@@ -127,14 +134,14 @@ async fn main() {
     {
         use plotly::common::{AxisSide, Line, LineShape, Marker, MarkerSymbol, Mode, Title};
         use plotly::configuration::{ImageButtonFormats, ToImageButtonOptions};
-        use plotly::layout::{Axis, GridPattern, LayoutGrid, RangeSlider, RowOrder};
+        use plotly::layout::{Axis, GridPattern, LayoutGrid, RowOrder};
         use plotly::Configuration;
         use plotly::{Layout, Plot, Scatter};
 
         // https://plotly.com/javascript/plotly-fundamentals/
         // https://igiagkiozis.github.io/plotly/content/recipes/subplots/multiple_axes.html
 
-        let (sent, ack, ack_envelope, dup, to) = {
+        let (sent, ack, ack_envelope, anticip, to) = {
             let trace = trace_recorder.lock().unwrap();
             let mut envelope_t = Vec::with_capacity(trace.acks.len());
             let mut envelope = Vec::with_capacity(trace.acks.len());
@@ -162,20 +169,20 @@ async fn main() {
                     .line(Line::new().shape(LineShape::Hv))
                     .web_gl_mode(true)
                     .name("ACK envelope"),
-                Scatter::new(trace.timestamps_dup.clone(), trace.dup.clone())
+                Scatter::new(trace.timestamps_anticip.clone(), trace.anticip.clone())
                     .mode(Mode::Markers)
                     .marker(
                         Marker::new()
-                            .symbol(MarkerSymbol::TriangleLeft)
+                            .symbol(MarkerSymbol::TriangleRight)
                             .color("#00FF00"),
                     )
                     .web_gl_mode(true)
-                    .name("Retransmit (dup acks)"),
+                    .name("Retransmit (anticipation)"),
                 Scatter::new(trace.timestamps_to.clone(), trace.to.clone())
                     .mode(Mode::Markers)
                     .marker(
                         Marker::new()
-                            .symbol(MarkerSymbol::TriangleLeft)
+                            .symbol(MarkerSymbol::TriangleRight)
                             .color("#0000FF"),
                     )
                     .web_gl_mode(true)
@@ -249,7 +256,7 @@ async fn main() {
 
         // Plot
         let mut plot = Plot::new();
-        plot.add_traces(vec![sent, ack, ack_envelope, dup, to]);
+        plot.add_traces(vec![sent, ack, ack_envelope, anticip, to]);
         plot.add_traces(vec![client_msg, limit_min, client_ack, client_drop]);
         //plot.add_trace(srtt);
         plot.add_trace(throughput);
