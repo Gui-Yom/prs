@@ -32,6 +32,9 @@ const MAX_DUP_ACK: i32 = 1;
 const ACK_TIMEOUT_MANUAL: Duration = Duration::from_micros(1100);
 /// Rate limiting
 const SEND_DELAY: Duration = Duration::from_micros(75);
+/// How many times to retransmit a packet in anticipation.
+/// Sending it multiple time will generate many ack delays, increasing the chances of seeing a short delay.
+const ANTICIPATION_COUNT: u32 = 2;
 
 /// Handle to a connected client
 #[derive(Debug)]
@@ -93,47 +96,43 @@ impl UdcpStream {
 
         let mut rate_limiter = Instant::now();
 
-        //let mut srtt = SRTT_START;
-        //trace!(srtt = srtt.as_micros(), "Initial srtt value");
-
-        let mut percent = 0.1;
+        // How often to report on advancement
+        let mut percent_step = 0.1;
 
         while (seq - 1) * DATA_SIZE < buf.len() || window != 0 {
             // Quick update
-            if ((seq - 1) * DATA_SIZE) as f32 / buf.len() as f32 > percent {
-                debug!("Transfer at {:.3}%", percent * 100.0);
-                percent += 0.1;
+            if ((seq - 1) * DATA_SIZE) as f32 / buf.len() as f32 > percent_step {
+                debug!("Transfer at {:.3}%", percent_step * 100.0);
+                percent_step += 0.1;
             }
 
-            // Try sending many frames
-            while (seq - 1) * DATA_SIZE < buf.len() && window < WINDOW_SIZE {
-                if rate_limiter.elapsed() > SEND_DELAY {
-                    rate_limiter = Instant::now();
+            // Precise sleeping is achieved via spinning. At least we try to spin usefully.
+            // Going through the whole loop acts as a short delay.
+            if window < WINDOW_SIZE
+                && (seq - 1) * DATA_SIZE < buf.len()
+                && rate_limiter.elapsed() > SEND_DELAY
+            {
+                rate_limiter = Instant::now();
 
-                    // Create the frame to send
-                    let data_len = self.send_frame(seq, buf).await;
-                    trace!(sent = data_len, seq, "Sent frame");
+                // Send a frame
+                let data_len = self.send_frame(seq, buf).await;
+                trace!(sent = data_len, seq, "Sent frame");
 
-                    // Only set the timeout if it's the first packet we are sending
-                    // The timeout is then controlled by the retransmission algorithms
-                    if window == 0 {
-                        next_timeout = Instant::now() + ACK_TIMEOUT_MANUAL;
-                    }
-
-                    // Append packet to window
-                    window += 1;
-                    // Increment next sequence number
-                    seq += 1;
+                // Only set the timeout if it's the first packet we are sending
+                // The timeout is then controlled by the retransmission algorithms
+                if window == 0 {
+                    next_timeout = Instant::now() + ACK_TIMEOUT_MANUAL;
                 }
 
-                // Precise sleeping is achieved via spinning. At least we try to spin usefully.
-                // Going through the whole loop acts as a short delay.
-                break;
+                // Append packet to window
+                window += 1;
+                // Increment next sequence number
+                seq += 1;
             }
 
-            // Receive acks in batch
-            // Only process those who were already received by the network stack
-            // Notice the use of a non blocking try_recv
+            // Receive acks in batch.
+            // Only process those who were already received by the network stack.
+            // Notice the use of a non blocking try_recv.
             'recv: loop {
                 match self.sock.try_recv(&mut self.frame) {
                     Ok(n) => {
@@ -172,14 +171,14 @@ impl UdcpStream {
                                 window -= num;
                                 acked = ack;
                                 if window > 0 {
-                                    for i in 0..2 {
+                                    for _ in 0..ANTICIPATION_COUNT {
                                         trace!(
                                             anticipation = ack + 1,
                                             "Retransmit in anticipation of packet loss"
                                         );
                                         let _ = self.send_frame((ack + 1) as usize, buf).await;
-                                        next_timeout = Instant::now() + ACK_TIMEOUT_MANUAL;
                                     }
+                                    next_timeout = Instant::now() + ACK_TIMEOUT_MANUAL;
                                 }
                             }
                         } else {
@@ -187,6 +186,7 @@ impl UdcpStream {
                         }
                     }
                     Err(e) if e.kind() == ErrorKind::WouldBlock => {
+                        // No more data immediately available in network buffer
                         break 'recv;
                     }
                     Err(e) => {
@@ -197,7 +197,7 @@ impl UdcpStream {
             }
 
             // Check timeout
-            if Instant::now() > next_timeout && window > 0 {
+            if window > 0 && Instant::now() > next_timeout {
                 trace!(
                     timeout = acked + 1,
                     "Timeout expired, retransmitting packet"

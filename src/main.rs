@@ -1,3 +1,6 @@
+use plotly::layout::RangeSlider;
+use std::collections::HashMap;
+use std::env;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -22,18 +25,17 @@ async fn main() {
 
     // Register matrics
     #[cfg(feature = "trace")]
-    let (trace_recorder, throughput_metric, registry) = {
+    let (trace_recorder, registry) = {
         //let srtt_layer = metrics::MetricLayer::<metrics::SrttMetric>::new();
         let trace_layer = metrics::MetricLayer::<metrics::TraceRecorder>::new();
-        let throughput_layer = metrics::MetricLayer::<metrics::ThroughputMetric>::new();
+        //let throughput_layer = metrics::MetricLayer::<metrics::ThroughputMetric>::new();
         (
             //srtt_layer.metric(),
             trace_layer.metric(),
-            throughput_layer.metric(),
+            //throughput_layer.metric(),
             registry
                 //.with(srtt_layer)
-                .with(trace_layer)
-                .with(throughput_layer),
+                .with(trace_layer), //.with(throughput_layer),
         )
     };
 
@@ -48,7 +50,7 @@ async fn main() {
         .try_init()
         .unwrap();
 
-    let port = 5001;
+    let port = env::args().skip(1).next().unwrap().parse().unwrap();
     let mut listener = UdcpListener::bind("0.0.0.0", port).await.unwrap();
     info!("Listening on 0.0.0.0:{port}");
 
@@ -76,6 +78,7 @@ async fn main() {
 
             // Client's task
             task::spawn(async move {
+                // Read the file name
                 let buf = {
                     let mut tmp = [0; 256];
                     let n = client.read(&mut tmp).await.unwrap();
@@ -89,8 +92,6 @@ async fn main() {
                     );
                     tmp
                 };
-
-                // TODO read file once (hashmap)
 
                 client.write(&buf).await.unwrap();
                 info!("Copy finished");
@@ -200,6 +201,7 @@ async fn main() {
                 .y_axis("y2")
         };*/
 
+        /*
         let throughput = {
             let mut throughput = throughput_metric.lock().unwrap();
             throughput.timestamps.pop();
@@ -210,7 +212,7 @@ async fn main() {
                 .line(Line::new().shape(LineShape::Hv))
                 .name("Throughput")
                 .y_axis("y2")
-        };
+        };*/
 
         let (client_msg, limit_min, client_ack, client_drop) = {
             let data = trace_data.lock().await;
@@ -259,17 +261,18 @@ async fn main() {
         plot.add_traces(vec![sent, ack, ack_envelope, anticip, to]);
         plot.add_traces(vec![client_msg, limit_min, client_ack, client_drop]);
         //plot.add_trace(srtt);
-        plot.add_trace(throughput);
+        //plot.add_trace(throughput);
 
         plot.set_layout(
             Layout::new()
+                /*
                 .grid(
                     LayoutGrid::new()
                         .rows(2)
                         .columns(1)
                         .pattern(GridPattern::Coupled)
                         .row_order(RowOrder::TopToBottom),
-                )
+                )*/
                 .y_axis(Axis::new().title(Title::new("sequence number")))
                 /*
                 .y_axis2(
@@ -277,15 +280,14 @@ async fn main() {
                         .title(Title::new("SRTT (µs)"))
                         .side(AxisSide::Right)
                         .domain(&[0., 5000.]),
-                )*/
+                )
                 .y_axis2(
                     Axis::new()
                         .title(Title::new("Throughput (Mo/s)"))
                         //.overlaying("y")
                         .side(AxisSide::Left)
                         .domain(&[0., 20.]),
-                )
-                //.x_axis(Axis::new().range_slider(RangeSlider::new().visible(true)))
+                )*/
                 .title(Title::new("Transfer trace")),
         );
 
