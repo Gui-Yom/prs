@@ -16,7 +16,7 @@ use tracing_subscriber::{fmt, EnvFilter, Layer};
 use udcp::metrics;
 use udcp::UdcpListener;
 
-#[tokio::main(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::main(flavor = "multi_thread", worker_threads = 6)]
 async fn main() {
     let registry = tracing_subscriber::registry();
 

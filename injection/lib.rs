@@ -1,6 +1,3 @@
-//! Requires libinjection to be built
-
-use std::ffi::{c_char, CStr};
 use std::net;
 use std::net::Ipv4Addr;
 use std::time::Instant;
@@ -23,9 +20,9 @@ pub extern "C" fn inject_start() {
 }
 
 #[no_mangle]
-pub extern "C" fn trace_server_ip(ip: *const c_char) {
+pub extern "C" fn trace_server_ip(ip: u32) {
     unsafe {
-        let _ = TRACE_IP.insert(CStr::from_ptr(ip).to_str().unwrap().parse().unwrap());
+        let _ = TRACE_IP.insert(Ipv4Addr::from(ip));
     }
 }
 

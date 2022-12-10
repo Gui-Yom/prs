@@ -19,24 +19,19 @@ use tracing::{debug, error, trace};
 #[cfg(feature = "trace")]
 pub mod metrics;
 
-/// MTU - IP header - UDP header
+/// 1500 MTU - IP header - UDP header
 const MAX_PACKET_SIZE: usize = 1472;
 /// Sequence number spanning 6 ascii chars
 const HEADER_SIZE: usize = 6;
 const DATA_SIZE: usize = MAX_PACKET_SIZE - HEADER_SIZE;
-/// Window size
+/// Window size, how many packets are sent without receiving ACK
 const WINDOW_SIZE: usize = 80;
-/// Max duplicate ACk to receive before retransmitting, must be < WINDOW_CAP - 1
+/// Max duplicate ACK to receive before retransmitting, must be < WINDOW_CAP - 1
 const MAX_DUP_ACK: i32 = 1;
-/// Weight of past srtt estimations
-const SRTT_ALPHA: f64 = 0.9;
-// TODO find the right value
-// Random timeout between 1 and 9 ms
-const SRTT_START: Duration = Duration::from_millis(3);
-const SRTT_MAX: Duration = Duration::from_millis(5);
+/// Timeout after which a packet is retransmitted
 const ACK_TIMEOUT_MANUAL: Duration = Duration::from_micros(1100);
 /// Rate limiting
-const SEND_DELAY: Duration = Duration::from_micros(70);
+const SEND_DELAY: Duration = Duration::from_micros(75);
 
 /// Handle to a connected client
 #[derive(Debug)]
@@ -56,9 +51,11 @@ impl UdcpStream {
         }
     }
 
-    /// Format a frame for sending
+    /// Format a frame for sending.
+    ///
+    /// `data` is a slice to the whole transmission, this method calculates bounds from the `seq` number.
     async fn send_frame(&mut self, seq: usize, data: &[u8]) -> usize {
-        // Write the sequence number
+        // Write the sequence number to the frame
         // Cursor because write! requires an impl of io::Write
         write!(
             Cursor::new(&mut self.frame[..]),
@@ -72,6 +69,7 @@ impl UdcpStream {
         let data_len = DATA_SIZE.min(data[(seq - 1) * DATA_SIZE..].len());
         self.frame[HEADER_SIZE..data_len + HEADER_SIZE]
             .copy_from_slice(&data[(seq - 1) * DATA_SIZE..(seq - 1) * DATA_SIZE + data_len]);
+        // Send the frame
         self.sock
             .send(&self.frame[..HEADER_SIZE + data_len])
             .await
@@ -110,6 +108,8 @@ impl UdcpStream {
             // Try sending many frames
             while (seq - 1) * DATA_SIZE < buf.len() && window < WINDOW_SIZE {
                 if rate_limiter.elapsed() > SEND_DELAY {
+                    rate_limiter = Instant::now();
+
                     // Create the frame to send
                     let data_len = self.send_frame(seq, buf).await;
                     trace!(sent = data_len, seq, "Sent frame");
@@ -124,8 +124,6 @@ impl UdcpStream {
                     window += 1;
                     // Increment next sequence number
                     seq += 1;
-
-                    rate_limiter = Instant::now();
                 }
 
                 // Precise sleeping is achieved via spinning. At least we try to spin usefully.
@@ -174,12 +172,14 @@ impl UdcpStream {
                                 window -= num;
                                 acked = ack;
                                 if window > 0 {
-                                    trace!(
-                                        anticipation = ack + 1,
-                                        "Retransmit in anticipation of packet loss"
-                                    );
-                                    let _ = self.send_frame((ack + 1) as usize, buf).await;
-                                    next_timeout = Instant::now() + ACK_TIMEOUT_MANUAL;
+                                    for i in 0..2 {
+                                        trace!(
+                                            anticipation = ack + 1,
+                                            "Retransmit in anticipation of packet loss"
+                                        );
+                                        let _ = self.send_frame((ack + 1) as usize, buf).await;
+                                        next_timeout = Instant::now() + ACK_TIMEOUT_MANUAL;
+                                    }
                                 }
                             }
                         } else {
