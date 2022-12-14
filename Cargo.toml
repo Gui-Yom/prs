@@ -24,3 +24,4 @@ plotly = { version = "0.8", optional = true }
 [features]
 # Record data for graphs and insights
 trace = ["serde", "bincode", "chrono", "plotly"]
+client2 = []

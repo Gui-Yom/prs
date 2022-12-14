@@ -1,5 +1,3 @@
-use plotly::layout::RangeSlider;
-use std::collections::HashMap;
 use std::env;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -50,7 +48,7 @@ async fn main() {
         .try_init()
         .unwrap();
 
-    let port = env::args().skip(1).next().unwrap().parse().unwrap();
+    let port = env::args().nth(1).unwrap().parse().unwrap();
     let mut listener = UdcpListener::bind("0.0.0.0", port).await.unwrap();
     info!("Listening on 0.0.0.0:{port}");
 
@@ -133,9 +131,9 @@ async fn main() {
     // Generate graphs before exiting
     #[cfg(feature = "trace")]
     {
-        use plotly::common::{AxisSide, Line, LineShape, Marker, MarkerSymbol, Mode, Title};
+        use plotly::common::{Line, LineShape, Marker, MarkerSymbol, Mode, Title};
         use plotly::configuration::{ImageButtonFormats, ToImageButtonOptions};
-        use plotly::layout::{Axis, GridPattern, LayoutGrid, RowOrder};
+        use plotly::layout::Axis;
         use plotly::Configuration;
         use plotly::{Layout, Plot, Scatter};
 
@@ -151,7 +149,7 @@ async fn main() {
                 if ack > max {
                     max = ack;
                     envelope.push(ack);
-                    envelope_t.push(ts.clone());
+                    envelope_t.push(*ts);
                 }
             }
             (

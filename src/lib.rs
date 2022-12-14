@@ -24,17 +24,6 @@ const MAX_PACKET_SIZE: usize = 1472;
 /// Sequence number spanning 6 ascii chars
 const HEADER_SIZE: usize = 6;
 const DATA_SIZE: usize = MAX_PACKET_SIZE - HEADER_SIZE;
-/// Window size, how many packets are sent without receiving ACK
-const WINDOW_SIZE: usize = 80;
-/// Max duplicate ACK to receive before retransmitting, must be < WINDOW_CAP - 1
-const MAX_DUP_ACK: i32 = 1;
-/// Timeout after which a packet is retransmitted
-const ACK_TIMEOUT_MANUAL: Duration = Duration::from_micros(1100);
-/// Rate limiting
-const SEND_DELAY: Duration = Duration::from_micros(75);
-/// How many times to retransmit a packet in anticipation.
-/// Sending it multiple time will generate many ack delays, increasing the chances of seeing a short delay.
-const ANTICIPATION_COUNT: u32 = 2;
 
 /// Handle to a connected client
 #[derive(Debug)]
@@ -81,7 +70,20 @@ impl UdcpStream {
     }
 
     /// Write to the stream, suspends until all data is received by the peer correctly (empty window)
+    #[cfg(not(feature = "client2"))]
     pub async fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        /// Window size, how many packets are sent without receiving ACK
+        const WINDOW_SIZE: usize = 80;
+        /// Max duplicate ACK to receive before retransmitting, must be < WINDOW_CAP - 1
+        const MAX_DUP_ACK: i32 = 1;
+        /// Timeout after which a packet is retransmitted
+        const ACK_TIMEOUT_MANUAL: Duration = Duration::from_micros(3000);
+        /// Rate limiting
+        const SEND_DELAY: Duration = Duration::from_micros(75);
+        /// How many times to retransmit a packet in anticipation.
+        /// Sending it multiple time will generate many ack delays, increasing the chances of seeing a short delay.
+        const ANTICIPATION_COUNT: u32 = 2;
+
         // Next sequence number to be sent
         let mut seq = 1;
         // Last acked sequence number (back of the window)
@@ -144,26 +146,23 @@ impl UdcpStream {
                             trace!(rseq = ack, "Received ACK");
 
                             if ack == acked {
-                                // No mechanism here
-                                /*
-                                if ack_wave == ack {
+                                // Anticipation is preferred if set.
+                                if ANTICIPATION_COUNT == 0 {
                                     dup_ack -= 1;
-                                } else {
-                                    dup_ack = seq as i32 - ack - 1;
-                                    ack_wave = ack;
-
-                                    if dup_ack <= 0 && window > 0 {
-                                        // Exceeded duplicate ack counter
-                                        // We only retransmit the packet we know has been lost
-                                        debug!(dupack = ack + 1, "Retransmitting lost packet");
-                                        let _ = self.send_frame((ack + 1) as usize, buf).await;
-                                        next_timeout = Instant::now() + ACK_TIMEOUT_MANUAL;
+                                    if dup_ack <= 0 {
+                                        if window > 0 && dup_ack != ack_wave {
+                                            // Exceeded duplicate ack counter
+                                            // We only retransmit the packet we know has been lost
+                                            trace!(dupack = ack + 1, "Retransmitting lost packet");
+                                            let _ = self.send_frame((ack + 1) as usize, buf).await;
+                                            next_timeout = Instant::now() + ACK_TIMEOUT_MANUAL;
+                                        }
+                                        ack_wave = ack;
+                                        // Reset the counter
+                                        dup_ack = MAX_DUP_ACK;
                                     }
-                                }*/
-                            } else if ack < acked {
-                                // This ack is outdated
-                                trace!("Ignored ACK");
-                            } else {
+                                }
+                            } else if ack > acked {
                                 // Valid ack sequence number
                                 // Validate everything until this ack
                                 //debug!(window, ack, acked, "help pls");
@@ -209,6 +208,133 @@ impl UdcpStream {
         Ok(buf.len())
     }
 
+    #[cfg(feature = "client2")]
+    pub async fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        /// Window size, how many packets are sent without receiving ACK
+        const WINDOW_SIZE: usize = 30;
+        /// Max duplicate ACK to receive before retransmitting, must be < WINDOW_CAP - 1
+        const MAX_DUP_ACK: i32 = 1;
+        /// Timeout after which a packet is retransmitted
+        const ACK_TIMEOUT_MANUAL: Duration = Duration::from_micros(8000);
+        /// Rate limiting
+        const SEND_DELAY: Duration = Duration::from_micros(800);
+
+        // Next sequence number to be sent
+        let mut seq = 1;
+        // Last acked sequence number (back of the window)
+        let mut acked: i32 = 0;
+        // Send window
+        let mut window = 0;
+
+        // Remaining duplicate ack to receive before retransmitting
+        let mut dup_ack = MAX_DUP_ACK;
+        let mut next_timeout = Instant::now();
+
+        let mut rate_limiter = Instant::now();
+
+        // How often to report on advancement
+        let mut percent_step = 0.1;
+
+        while (seq - 1) * DATA_SIZE < buf.len() || window != 0 {
+            // Quick update
+            if ((seq - 1) * DATA_SIZE) as f32 / buf.len() as f32 > percent_step {
+                debug!("Transfer at {:.3}%", percent_step * 100.0);
+                percent_step += 0.1;
+            }
+
+            // Precise sleeping is achieved via spinning. At least we try to spin usefully.
+            // Going through the whole loop acts as a short delay.
+            if window < WINDOW_SIZE
+                && (seq - 1) * DATA_SIZE < buf.len()
+                && rate_limiter.elapsed() > SEND_DELAY
+            {
+                rate_limiter = Instant::now();
+
+                // Send a frame
+                let data_len = self.send_frame(seq, buf).await;
+                trace!(sent = data_len, seq, "Sent frame");
+
+                // Only set the timeout if it's the first packet we are sending
+                // The timeout is then controlled by the retransmission algorithms
+                if window == 0 {
+                    next_timeout = Instant::now() + ACK_TIMEOUT_MANUAL;
+                }
+
+                // Append packet to window
+                window += 1;
+                // Increment next sequence number
+                seq += 1;
+            }
+
+            // Receive acks in batch.
+            // Only process those who were already received by the network stack.
+            // Notice the use of a non blocking try_recv.
+            'recv: loop {
+                match self.sock.try_recv(&mut self.frame) {
+                    Ok(n) => {
+                        if n == 10 && &self.frame[..3] == b"ACK" {
+                            // Read the ack sequence number
+                            let ack = unsafe { from_utf8_unchecked(&self.frame[3..9]) }
+                                .parse()
+                                .unwrap();
+                            trace!(rseq = ack, "Received ACK");
+
+                            if ack == acked {
+                                // Anticipation is preferred if set.
+                                dup_ack -= 1;
+                                if dup_ack <= 0 {
+                                    // Exceeded duplicate ack counter
+                                    // We retransmit the whole window
+                                    for i in 0..window {
+                                        //.min(15) {
+                                        trace!(
+                                            dupack = acked + 1 + i as i32,
+                                            "Retransmitting lost packet"
+                                        );
+                                        let _ = self
+                                            .send_frame((acked + 1 + i as i32) as usize, buf)
+                                            .await;
+                                        next_timeout = Instant::now() + ACK_TIMEOUT_MANUAL;
+                                    }
+                                    // Reset the counter
+                                    dup_ack = 3 * MAX_DUP_ACK;
+                                }
+                            } else if ack > acked {
+                                // Valid ack sequence number
+                                // Validate everything until this ack
+                                //debug!(window, ack, acked, "help pls");
+                                let num = (ack as i32 - acked) as usize;
+                                window -= num;
+                                acked = ack;
+                            }
+                        } else {
+                            error!("Received something other than an ACK");
+                        }
+                    }
+                    Err(e) if e.kind() == ErrorKind::WouldBlock => {
+                        // No more data immediately available in network buffer
+                        break 'recv;
+                    }
+                    Err(e) => {
+                        error!("Error while receiving : {e}");
+                        return Err(e);
+                    }
+                }
+            }
+
+            // Check timeout
+            if window > 0 && Instant::now() > next_timeout {
+                trace!(
+                    timeout = acked + 1,
+                    "Timeout expired, retransmitting packet"
+                );
+                let _ = self.send_frame((acked + 1) as usize, buf).await;
+                next_timeout = Instant::now() + ACK_TIMEOUT_MANUAL;
+            }
+        }
+        Ok(buf.len())
+    }
+
     /// Read from the stream
     pub async fn read(&self, buf: &mut [u8]) -> io::Result<usize> {
         self.sock.recv(buf).await
@@ -221,6 +347,7 @@ impl UdcpStream {
     }
 }
 
+/// Time after which to retransmit SYN-ACK
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Handle to a server
@@ -251,7 +378,7 @@ impl UdcpListener {
         // Min wait duration for the next event
         let mut wait = Duration::from_secs(u64::MAX);
 
-        'main: loop {
+        loop {
             debug!(wait = wait.as_millis(), "Waiting");
             let client_addr = match timeout(wait, sock.recv_from(&mut buf)).await {
                 Ok(Ok((_, client_addr))) => client_addr,
