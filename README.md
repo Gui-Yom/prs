@@ -4,7 +4,11 @@ User datagram control protocol unidirectional server implementation.
 
 ## Building and running
 
-Cargo and a rust toolchain must be installed. See [rustup](https://rustup.rs/).
+Cargo and a rust toolchain must be installed. See [rustup](https://rustup.rs/). Or simply run the `setup` target :
+
+```shell
+make setup
+```
 
 ### Running the server
 
@@ -33,7 +37,7 @@ cargo run --release --features tracing/release_max_level_debug
 
 ## Reverse engineering
 
-![ghidra interface](docs/ghidra.png)
+![ghidra interface](docs/images/ghidra.png)
 
 ### Client drop rate
 
@@ -61,7 +65,7 @@ The initial drop rate is 1%. A throughput threshold is randomly chosen every 100
 greater than this threshold, the drop rates becomes 5%. With a given throughput, the average drop rate fluctuates like
 this :
 
-![average drop rate curve](docs/drop_rate_curve.png)
+![average drop rate curve](docs/images/drop_rate_curve.png)
 
 The maximum throughput is somewhere around 20 MB/s, which is the computational limit of the client.
 
@@ -73,7 +77,3 @@ processes.
 https://unix.stackexchange.com/questions/447898/why-does-a-program-with-fork-sometimes-print-its-output-multiple-times
 
 To fix this bug, we inject a dll to hook `fork()` and call `fflush(stdout)` before actually forking.
-
-## Client data processing
-
-`client_postprocessing`

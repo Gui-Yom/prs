@@ -69,6 +69,7 @@ impl UdcpStream {
         data_len
     }
 
+    /// For the scenarios 1 & 3
     /// Write to the stream, suspends until all data is received by the peer correctly (empty window)
     #[cfg(not(feature = "client2"))]
     pub async fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
@@ -208,6 +209,7 @@ impl UdcpStream {
         Ok(buf.len())
     }
 
+    /// For the scenario 2
     #[cfg(feature = "client2")]
     pub async fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         /// Window size, how many packets are sent without receiving ACK
@@ -280,13 +282,11 @@ impl UdcpStream {
                             trace!(rseq = ack, "Received ACK");
 
                             if ack == acked {
-                                // Anticipation is preferred if set.
                                 dup_ack -= 1;
                                 if dup_ack <= 0 {
                                     // Exceeded duplicate ack counter
                                     // We retransmit the whole window
                                     for i in 0..window {
-                                        //.min(15) {
                                         trace!(
                                             dupack = acked + 1 + i as i32,
                                             "Retransmitting lost packet"
@@ -302,7 +302,6 @@ impl UdcpStream {
                             } else if ack > acked {
                                 // Valid ack sequence number
                                 // Validate everything until this ack
-                                //debug!(window, ack, acked, "help pls");
                                 let num = (ack as i32 - acked) as usize;
                                 window -= num;
                                 acked = ack;
